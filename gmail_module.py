@@ -14,9 +14,12 @@ Setup:
 """
 
 import base64
+import io
 import re
 from email.mime.text import MIMEText
 from pathlib import Path
+
+from PyPDF2 import PdfReader
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -180,6 +183,7 @@ def read_email(msg_id: str, account: str | None = None) -> dict:
     headers = {h["name"]: h["value"] for h in msg.get("payload", {}).get("headers", [])}
 
     body = _extract_body(msg.get("payload", {}))
+    attachments = _list_attachments(msg.get("payload", {}))
 
     return {
         "id": msg["id"],
@@ -190,6 +194,7 @@ def read_email(msg_id: str, account: str | None = None) -> dict:
         "date": headers.get("Date", ""),
         "body": body,
         "labels": msg.get("labelIds", []),
+        "attachments": attachments,
     }
 
 
@@ -271,3 +276,94 @@ def mark_as_read(msg_id: str, account: str | None = None) -> None:
     service.users().messages().modify(
         userId="me", id=msg_id, body={"removeLabelIds": ["UNREAD"]}
     ).execute()
+
+
+# ── Attachment Handling ───────────────────────────────────────────
+
+def _list_attachments(payload: dict) -> list[dict]:
+    """Extract attachment metadata from an email payload."""
+    attachments = []
+    _walk_parts_for_attachments(payload, attachments)
+    return attachments
+
+
+def _walk_parts_for_attachments(part: dict, out: list[dict]) -> None:
+    filename = part.get("filename", "")
+    body = part.get("body", {})
+    attachment_id = body.get("attachmentId")
+
+    if filename and attachment_id:
+        out.append({
+            "filename": filename,
+            "attachment_id": attachment_id,
+            "mime_type": part.get("mimeType", ""),
+            "size": body.get("size", 0),
+        })
+
+    for sub in part.get("parts", []):
+        _walk_parts_for_attachments(sub, out)
+
+
+def download_attachment(msg_id: str, attachment_id: str, account: str | None = None) -> bytes:
+    """Download raw attachment bytes from Gmail."""
+    service = _get_service(account)
+    att = service.users().messages().attachments().get(
+        userId="me", messageId=msg_id, id=attachment_id,
+    ).execute()
+    data = att.get("data", "")
+    return base64.urlsafe_b64decode(data)
+
+
+def read_pdf_attachment(msg_id: str, attachment_id: str, account: str | None = None) -> str:
+    """Download a PDF attachment and extract its text content."""
+    raw_bytes = download_attachment(msg_id, attachment_id, account=account)
+    reader = PdfReader(io.BytesIO(raw_bytes))
+
+    pages = []
+    for i, page in enumerate(reader.pages):
+        text = page.extract_text()
+        if text and text.strip():
+            pages.append(f"--- Page {i + 1} ---\n{text.strip()}")
+
+    if not pages:
+        return "(PDF has no extractable text — may be scanned/image-based)"
+
+    return "\n\n".join(pages)
+
+
+def get_email_with_pdf_text(msg_id: str, account: str | None = None) -> dict:
+    """Read an email and auto-extract text from all PDF attachments."""
+    email = read_email(msg_id, account=account)
+
+    pdf_texts = []
+    for att in email.get("attachments", []):
+        if att["mime_type"] == "application/pdf" or att["filename"].lower().endswith(".pdf"):
+            try:
+                text = read_pdf_attachment(msg_id, att["attachment_id"], account=account)
+                pdf_texts.append({"filename": att["filename"], "text": text})
+            except Exception as e:
+                pdf_texts.append({"filename": att["filename"], "text": f"(extraction failed: {e})"})
+
+    email["pdf_texts"] = pdf_texts
+    return email
+
+
+def search_pdfs(query: str, max_results: int = 5, account: str | None = None) -> list[dict]:
+    """Search for emails with PDF attachments, extract text from each."""
+    search_query = f"has:attachment filename:pdf {query}"
+    emails = list_emails(max_results=max_results, query=search_query, account=account)
+
+    results = []
+    for em in emails:
+        full = get_email_with_pdf_text(em["id"], account=account)
+        for pdf in full.get("pdf_texts", []):
+            results.append({
+                "email_id": em["id"],
+                "email_subject": em["subject"],
+                "email_from": em["from"],
+                "email_date": em["date"],
+                "filename": pdf["filename"],
+                "text": pdf["text"],
+            })
+
+    return results

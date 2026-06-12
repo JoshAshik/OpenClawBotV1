@@ -28,10 +28,19 @@ RATE_LIMIT_PER_HOUR = int(os.getenv("RATE_LIMIT_PER_HOUR", "20"))
 DB_PATH = Path(__file__).parent / "clawdbot.db"
 
 # Default LLM
-DEFAULT_LLM = "claude"
+DEFAULT_LLM = os.getenv("DEFAULT_LLM", "chatgpt")
 
 # Google Places API (for review monitoring)
 GOOGLE_PLACES_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY", "")
 
 # Review polling interval in minutes
 REVIEW_POLL_INTERVAL_MINUTES = int(os.getenv("REVIEW_POLL_INTERVAL_MINUTES", "15"))
+
+# OneDrive (personal Microsoft account)
+ONEDRIVE_CLIENT_ID = os.getenv("ONEDRIVE_CLIENT_ID", "")
+
+# Search index polling interval in minutes
+INDEX_POLL_INTERVAL_MINUTES = int(os.getenv("INDEX_POLL_INTERVAL_MINUTES", "10"))
+
+# Default Gmail account label (set on startup if token exists)
+DEFAULT_GMAIL_ACCOUNT = os.getenv("DEFAULT_GMAIL_ACCOUNT", "personal")

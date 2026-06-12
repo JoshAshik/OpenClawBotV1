@@ -1,29 +1,12 @@
 """
 Telegram bot — the primary interface for Clawdbot.
 
-Commands:
-  /start          — Welcome + auth check
-  /pin <code>     — Unlock session (if PIN configured)
-  /lock           — Lock session manually
-  /switch <llm>   — Switch between claude / chatgpt
-  /status         — Current state
-  /audit          — Recent audit log entries
-  /emails         — List recent inbox emails
-  /search <query> — Search emails (Gmail query syntax)
-  /read <id>      — Read a specific email by ID
-  /draft          — AI-draft a reply or new email (approval required)
-  /send           — Send an email (approval required)
-  /properties     — List monitored properties
-  /addproperty    — Search & add a property to monitor
-  /removeproperty — Stop monitoring a property
-  /reviews        — Show recent reviews across all properties
-  /checkreviews   — Manually trigger a review check now
-  /help           — List commands
-
-All free-text messages are routed to the active LLM for conversation.
+Natural language is the main interface — the user types plain English and
+the LLM agent decides which tools to call (search emails, read PDFs,
+check reviews, etc.). Slash commands still work as shortcuts.
 
 Outbound actions (send email, send message) go through the approval flow:
-  1. Bot presents a preview with Approve / Edit / Reject buttons
+  1. Bot presents a preview with Approve / Reject buttons
   2. Only on Approve does the action execute
   3. Everything is audit-logged
 """
@@ -44,8 +27,10 @@ from telegram.ext import (
 import config
 import db
 import gmail_module
+import indexer
 import llm
 import reviews
+import search_index
 import security
 from security import ActionCategory, auth_required
 
@@ -80,33 +65,28 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 @auth_required
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "*Clawdbot Commands*\n\n"
-        "*General*\n"
-        "/start — Wake up & status\n"
+        "*Clawdbot — Just talk to me!*\n\n"
+        "Type naturally and I'll figure out what to do:\n"
+        "  \"Show me my latest emails\"\n"
+        "  \"Find the lease for 123 Oak St\"\n"
+        "  \"Any new reviews on my properties?\"\n"
+        "  \"Draft an email to john@... about the maintenance\"\n\n"
+        "I'll search emails, read PDFs, check reviews, and more — "
+        "automatically. Sending anything always requires your approval.\n\n"
+        "*Shortcut commands* (optional)\n"
+        "/switch `<claude|chatgpt>` — Switch LLM\n"
+        "/accounts — List connected Gmail accounts\n"
+        "/addaccount `<label>` — Connect a Gmail account\n"
+        "/useaccount `<label>` — Switch active account\n"
+        "/addproperty `<name>` — Add a property to monitor\n"
+        "/connectonedrive — Connect personal OneDrive\n"
+        "/reindex — Trigger full reindex now\n\n"
+        "*Admin*\n"
         "/pin `<code>` — Unlock session\n"
         "/lock — Lock session\n"
-        "/switch `<claude|chatgpt>` — Switch LLM\n"
         "/status — Current state\n"
         "/audit — Recent audit log\n"
-        "/help — This message\n\n"
-        "*Email*\n"
-        "/accounts — List connected Gmail accounts\n"
-        "/addaccount `<label>` — Connect a Gmail (e.g. personal, work)\n"
-        "/useaccount `<label>` — Switch active account\n"
-        "/emails — Recent inbox (10)\n"
-        "/emails `<N>` — Recent inbox (N)\n"
-        "/search `<query>` — Search emails\n"
-        "/read `<id>` — Read full email\n"
-        "/draft `<to> | <subject> | <body>` — Draft email for approval\n"
-        "/send `<to> | <subject> | <body>` — Send email (requires approval)\n"
-        "/aidraft `<instructions>` — AI drafts an email for you\n\n"
-        "*Reviews*\n"
-        "/properties — List monitored properties\n"
-        "/addproperty `<name>` — Search & add a property\n"
-        "/removeproperty `<place_id>` — Stop monitoring\n"
-        "/reviews — Recent reviews (all properties)\n"
-        "/checkreviews — Manual review check now\n\n"
-        "_Just type normally to chat with the AI._",
+        "/help — This message",
         parse_mode="Markdown",
     )
 
@@ -569,6 +549,499 @@ def _parse_ai_draft(text: str) -> tuple[str, str, str]:
     return to, subject, body
 
 
+# ── Attachment & PDF Commands ─────────────────────────────────────
+
+@auth_required
+async def cmd_attachments(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List attachments on a specific email."""
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /attachments `<email_id>`\nGet IDs from /emails or /search",
+            parse_mode="Markdown",
+        )
+        return
+
+    msg_id = context.args[0]
+    try:
+        email = gmail_module.read_email(msg_id)
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
+        return
+
+    attachments = email.get("attachments", [])
+    if not attachments:
+        await update.message.reply_text(
+            f"*{email['subject']}*\n\nNo attachments on this email.",
+            parse_mode="Markdown",
+        )
+        return
+
+    lines = [f"*Attachments on:* {email['subject']}\n"]
+    for i, att in enumerate(attachments, 1):
+        size_kb = att["size"] / 1024
+        is_pdf = att["mime_type"] == "application/pdf" or att["filename"].lower().endswith(".pdf")
+        pdf_tag = " [PDF]" if is_pdf else ""
+        lines.append(f"{i}. `{att['filename']}`{pdf_tag} ({size_kb:.1f} KB)")
+
+    if any(a["filename"].lower().endswith(".pdf") for a in attachments):
+        lines.append(f"\nUse /readpdf `{msg_id}` to extract PDF text.")
+
+    await db.log_audit("list_attachments", "read",
+                       f"Listed {len(attachments)} attachments on {msg_id}",
+                       user_id=update.effective_user.id, approved=True)
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+@auth_required
+async def cmd_readpdf(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Extract text from all PDF attachments on an email."""
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /readpdf `<email_id>`\n\n"
+            "Extracts text from all PDF attachments on the email.\n"
+            "Get email IDs from /emails or /search",
+            parse_mode="Markdown",
+        )
+        return
+
+    msg_id = context.args[0]
+    await update.message.reply_text("Extracting PDF text...")
+
+    try:
+        result = gmail_module.get_email_with_pdf_text(msg_id)
+    except Exception as e:
+        logger.exception("PDF extraction failed")
+        await update.message.reply_text(f"Error: {e}")
+        return
+
+    pdf_texts = result.get("pdf_texts", [])
+    if not pdf_texts:
+        await update.message.reply_text(
+            f"*{result['subject']}*\n\nNo PDF attachments found on this email.",
+            parse_mode="Markdown",
+        )
+        return
+
+    await db.log_audit("read_pdf", "read",
+                       f"Extracted {len(pdf_texts)} PDFs from {msg_id}",
+                       user_id=update.effective_user.id, approved=True)
+
+    for pdf in pdf_texts:
+        header = f"*PDF: {pdf['filename']}*\n\n"
+        text = pdf["text"]
+
+        # Split into chunks if needed (Telegram max 4096)
+        full = header + text
+        if len(full) > 4000:
+            await update.message.reply_text(header + text[:3900] + "\n\n_(truncated)_", parse_mode="Markdown")
+        else:
+            await update.message.reply_text(full, parse_mode="Markdown")
+
+
+@auth_required
+async def cmd_searchpdfs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Search Gmail for emails with PDF attachments and extract their text."""
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /searchpdfs `<query>`\n\n"
+            "Examples:\n"
+            "  /searchpdfs lease agreement\n"
+            "  /searchpdfs from:tenant invoice\n"
+            "  /searchpdfs maintenance report 2026",
+            parse_mode="Markdown",
+        )
+        return
+
+    query = " ".join(context.args)
+    await update.message.reply_text(f"Searching for PDFs matching: {query}...")
+
+    try:
+        results = gmail_module.search_pdfs(query, max_results=5)
+    except Exception as e:
+        logger.exception("PDF search failed")
+        await update.message.reply_text(f"Search error: {e}")
+        return
+
+    if not results:
+        await update.message.reply_text("No PDF attachments found matching that query.")
+        return
+
+    await db.log_audit("search_pdfs", "read",
+                       f"PDF search: {query} ({len(results)} results)",
+                       user_id=update.effective_user.id, approved=True)
+
+    for r in results:
+        text_preview = r["text"][:1500]
+        if len(r["text"]) > 1500:
+            text_preview += "\n\n_(truncated — use /readpdf for full text)_"
+
+        msg = (
+            f"*{r['filename']}*\n"
+            f"From: {r['email_from']}\n"
+            f"Subject: {r['email_subject']}\n"
+            f"Date: {r['email_date']}\n"
+            f"Email ID: `{r['email_id']}`\n\n"
+            f"{text_preview}"
+        )
+
+        if len(msg) > 4000:
+            msg = msg[:4000] + "\n..."
+        await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+# ── Unified Search Commands ───────────────────────────────────────
+
+SOURCE_ICONS = {
+    "gmail": "Email",
+    "onedrive": "OneDrive",
+    "imessage": "iMessage",
+    "whatsapp": "WhatsApp",
+}
+
+
+@auth_required
+async def cmd_find(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Search across all indexed sources."""
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /find `<query>`\n\n"
+            "Examples:\n"
+            "  /find lease agreement unit 4B\n"
+            "  /find plumbing issue 123 Oak\n"
+            "  /find invoice from contractor\n\n"
+            "Searches emails, PDFs, OneDrive files, iMessages, and WhatsApp.\n"
+            "Use /findlive for real-time search (slower).",
+            parse_mode="Markdown",
+        )
+        return
+
+    query = " ".join(context.args)
+
+    try:
+        results = await search_index.search(query, limit=10)
+    except Exception as e:
+        logger.exception("Search failed")
+        await update.message.reply_text(f"Search error: {e}")
+        return
+
+    if not results:
+        await update.message.reply_text(
+            f"No results for: {query}\n\nTry /findlive for a live search, or /reindex to update the index."
+        )
+        return
+
+    await db.log_audit("search", "read", f"Search: {query} ({len(results)} results)",
+                       user_id=update.effective_user.id, approved=True)
+
+    lines = [f"*Search: {query}* ({len(results)} results)\n"]
+    for i, r in enumerate(results, 1):
+        source_label = SOURCE_ICONS.get(r["source"], r["source"])
+        meta = r.get("metadata", {})
+        date_str = meta.get("date", meta.get("modified", ""))[:10]
+        extra = ""
+        if meta.get("from"):
+            extra = f"\n   From: {meta['from'][:40]}"
+        elif meta.get("contact"):
+            extra = f"\n   Contact: {meta['contact']}"
+        elif meta.get("filename"):
+            extra = f"\n   File: {meta['filename']}"
+
+        lines.append(
+            f"{i}. [{source_label}] *{r['title'][:60]}*{extra}\n"
+            f"   {r['snippet']}\n"
+            f"   `{r['source']}:{r['source_id'][:20]}`"
+        )
+        if date_str:
+            lines[-1] += f" | {date_str}"
+
+    text = "\n\n".join(lines)
+    if len(text) > 4000:
+        text = text[:4000] + "\n..."
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+@auth_required
+async def cmd_findlive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Live search across all sources (hits APIs in real time)."""
+    if not context.args:
+        await update.message.reply_text("Usage: /findlive `<query>`", parse_mode="Markdown")
+        return
+
+    query = " ".join(context.args)
+    await update.message.reply_text(f"Searching live across all sources for: {query}...")
+
+    results = []
+
+    # Gmail live search (all accounts)
+    accounts = gmail_module.get_connected_accounts()
+    for acc in accounts:
+        try:
+            emails = gmail_module.search_emails(query, max_results=5, account=acc["label"])
+            for em in emails:
+                results.append({
+                    "source": f"Gmail ({acc['label']})",
+                    "title": em["subject"],
+                    "snippet": em["snippet"][:200],
+                    "id": em["id"],
+                    "date": em["date"],
+                })
+        except Exception as e:
+            logger.warning(f"Live Gmail search failed ({acc['label']}): {e}")
+
+    # OneDrive live search
+    try:
+        from onedrive_module import search_files, is_connected
+        if is_connected():
+            files = search_files(query)
+            for f in files[:5]:
+                results.append({
+                    "source": "OneDrive",
+                    "title": f["name"],
+                    "snippet": f["path"],
+                    "id": f["id"],
+                    "date": f.get("modified", ""),
+                })
+    except Exception as e:
+        logger.warning(f"Live OneDrive search failed: {e}")
+
+    # iMessage live search
+    try:
+        from imessage_module import search_messages, is_available
+        if is_available():
+            msgs = search_messages(query, limit=5)
+            for m in msgs:
+                results.append({
+                    "source": "iMessage",
+                    "title": f"Message with {m['contact']}",
+                    "snippet": m["text"][:200],
+                    "id": str(m["rowid"]),
+                    "date": m["date"],
+                })
+    except Exception as e:
+        logger.warning(f"Live iMessage search failed: {e}")
+
+    # WhatsApp live search
+    try:
+        from whatsapp_module import search_messages as wa_search, is_available as wa_available
+        if wa_available():
+            msgs = wa_search(query, limit=5)
+            for m in msgs:
+                results.append({
+                    "source": "WhatsApp",
+                    "title": f"Chat with {m['contact']}",
+                    "snippet": m["text"][:200],
+                    "id": m["id"],
+                    "date": m["date"],
+                })
+    except Exception as e:
+        logger.warning(f"Live WhatsApp search failed: {e}")
+
+    if not results:
+        await update.message.reply_text(f"No live results for: {query}")
+        return
+
+    await db.log_audit("search_live", "read", f"Live search: {query} ({len(results)} results)",
+                       user_id=update.effective_user.id, approved=True)
+
+    lines = [f"*Live Search: {query}* ({len(results)} results)\n"]
+    for i, r in enumerate(results, 1):
+        date_str = r.get("date", "")[:10]
+        lines.append(
+            f"{i}. [{r['source']}] *{r['title'][:60]}*\n"
+            f"   {r['snippet'][:150]}"
+        )
+        if date_str:
+            lines[-1] += f"\n   {date_str}"
+
+    text = "\n\n".join(lines)
+    if len(text) > 4000:
+        text = text[:4000] + "\n..."
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+@auth_required
+async def cmd_indexstats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    stats = await search_index.get_index_stats()
+    lines = ["*Search Index Stats*\n"]
+    for source, count in sorted(stats.items()):
+        if source == "total":
+            continue
+        icon = SOURCE_ICONS.get(source, source)
+        lines.append(f"  {icon}: {count} items")
+    lines.append(f"\n*Total: {stats.get('total', 0)} items*")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+@auth_required
+async def cmd_reindex(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("Starting full reindex across all sources...")
+
+    try:
+        results = await indexer.full_reindex()
+    except Exception as e:
+        logger.exception("Reindex failed")
+        await update.message.reply_text(f"Reindex error: {e}")
+        return
+
+    total = sum(results.values())
+    lines = [f"*Reindex complete: {total} new items*\n"]
+    for source, count in results.items():
+        icon = SOURCE_ICONS.get(source, source)
+        lines.append(f"  {icon}: {count} new")
+
+    await db.log_audit("reindex", "read", f"Full reindex: {total} items",
+                       user_id=update.effective_user.id, approved=True)
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+# ── OneDrive Commands ─────────────────────────────────────────────
+
+@auth_required
+async def cmd_connectonedrive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        from onedrive_module import get_auth_url, exchange_code
+    except ImportError:
+        await update.message.reply_text("OneDrive module not available.")
+        return
+
+    if context.args and len(context.args[0]) > 10:
+        # User is providing the auth code
+        code = context.args[0]
+        try:
+            name = exchange_code(code)
+            await db.log_audit("connect_onedrive", "config", f"Connected OneDrive: {name}",
+                               user_id=update.effective_user.id, approved=True)
+            await update.message.reply_text(f"OneDrive connected as: *{name}*", parse_mode="Markdown")
+        except Exception as e:
+            await update.message.reply_text(f"Connection failed: {e}")
+        return
+
+    try:
+        url = get_auth_url()
+    except RuntimeError as e:
+        await update.message.reply_text(str(e))
+        return
+
+    await update.message.reply_text(
+        "*Connect OneDrive*\n\n"
+        f"1. Open this URL in your browser:\n`{url}`\n\n"
+        "2. Sign in with your personal Microsoft account\n"
+        "3. After approval, you'll be redirected to localhost\n"
+        "4. Copy the `code=` value from the URL\n"
+        "5. Send: /connectonedrive `<code>`",
+        parse_mode="Markdown",
+    )
+
+
+@auth_required
+async def cmd_odfiles(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        from onedrive_module import list_files
+    except ImportError:
+        await update.message.reply_text("OneDrive module not available.")
+        return
+
+    folder = "/"
+    if context.args:
+        folder = " ".join(context.args)
+
+    try:
+        files = list_files(folder_path=folder)
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
+        return
+
+    if not files:
+        await update.message.reply_text("No files found.")
+        return
+
+    lines = [f"*OneDrive: {folder}* ({len(files)} files)\n"]
+    for i, f in enumerate(files[:20], 1):
+        size_kb = f["size"] / 1024
+        is_pdf = f["name"].lower().endswith(".pdf")
+        tag = " [PDF]" if is_pdf else ""
+        lines.append(f"{i}. `{f['name']}`{tag} ({size_kb:.0f} KB)\n   ID: `{f['id'][:20]}`")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+@auth_required
+async def cmd_odsearch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text("Usage: /odsearch `<query>`", parse_mode="Markdown")
+        return
+
+    try:
+        from onedrive_module import search_files
+    except ImportError:
+        await update.message.reply_text("OneDrive module not available.")
+        return
+
+    query = " ".join(context.args)
+    try:
+        files = search_files(query)
+    except Exception as e:
+        await update.message.reply_text(f"Search error: {e}")
+        return
+
+    if not files:
+        await update.message.reply_text(f"No files matching: {query}")
+        return
+
+    lines = [f"*OneDrive search: {query}* ({len(files)} results)\n"]
+    for i, f in enumerate(files[:10], 1):
+        lines.append(f"{i}. `{f['name']}` ({f['size'] / 1024:.0f} KB)\n   ID: `{f['id'][:20]}`")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+@auth_required
+async def cmd_odread(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text("Usage: /odread `<file_id>`", parse_mode="Markdown")
+        return
+
+    try:
+        from onedrive_module import download_file_text
+    except ImportError:
+        await update.message.reply_text("OneDrive module not available.")
+        return
+
+    file_id = context.args[0]
+    filename = context.args[1] if len(context.args) > 1 else "file.pdf"
+
+    await update.message.reply_text("Downloading and extracting text...")
+    try:
+        text = download_file_text(file_id, filename)
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
+        return
+
+    if not text:
+        await update.message.reply_text("No text could be extracted from this file.")
+        return
+
+    header = f"*{filename}*\n\n"
+    full = header + text
+    if len(full) > 4000:
+        await update.message.reply_text(header + text[:3900] + "\n\n_(truncated)_", parse_mode="Markdown")
+    else:
+        await update.message.reply_text(full, parse_mode="Markdown")
+
+
+# ── Background Indexer ────────────────────────────────────────────
+
+async def _background_index(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Called by job_queue on interval. Indexes new content from all sources."""
+    try:
+        results = await indexer.incremental_index()
+        total = sum(results.values())
+        if total > 0:
+            logger.info(f"Background index: {total} new items")
+    except Exception as e:
+        logger.error(f"Background index failed: {e}")
+
+
 # ── Review Commands ───────────────────────────────────────────────
 
 @auth_required
@@ -928,7 +1401,7 @@ async def execute_approved_action(action: dict) -> str:
 
 @auth_required
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Route free-text messages to the active LLM."""
+    """Route free-text messages to the LLM agent (auto tool-calling)."""
     user_text = update.message.text
     if not user_text:
         return
@@ -939,18 +1412,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     history = await db.get_recent_conversations(limit=20)
 
     try:
-        response = await llm.chat(user_text, history)
+        result = await llm.agent_chat(user_text, history)
     except Exception as e:
-        logger.exception("LLM call failed")
+        logger.exception("LLM agent call failed")
         await update.message.reply_text(f"LLM error: {type(e).__name__}: {e}")
         return
 
-    max_len = 4000
-    if len(response) > max_len:
-        for i in range(0, len(response), max_len):
-            await update.message.reply_text(response[i : i + max_len])
-    else:
-        await update.message.reply_text(response)
+    # Send the text response
+    response = result["text"]
+    if response:
+        max_len = 4000
+        if len(response) > max_len:
+            for i in range(0, len(response), max_len):
+                await update.message.reply_text(response[i : i + max_len])
+        else:
+            await update.message.reply_text(response)
+
+    # Route any write actions through the approval flow
+    for action in result.get("actions", []):
+        await request_approval(
+            update,
+            context,
+            action_type=action["type"],
+            category=ActionCategory.WRITE,
+            summary=action["summary"],
+            detail=action["detail"],
+            payload=action["payload"],
+        )
 
 
 # ── Bot Setup ─────────────────────────────────────────────────────
@@ -974,6 +1462,17 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("send", cmd_send))
     app.add_handler(CommandHandler("draft", cmd_draft))
     app.add_handler(CommandHandler("aidraft", cmd_aidraft))
+    app.add_handler(CommandHandler("attachments", cmd_attachments))
+    app.add_handler(CommandHandler("readpdf", cmd_readpdf))
+    app.add_handler(CommandHandler("searchpdfs", cmd_searchpdfs))
+    app.add_handler(CommandHandler("find", cmd_find))
+    app.add_handler(CommandHandler("findlive", cmd_findlive))
+    app.add_handler(CommandHandler("indexstats", cmd_indexstats))
+    app.add_handler(CommandHandler("reindex", cmd_reindex))
+    app.add_handler(CommandHandler("connectonedrive", cmd_connectonedrive))
+    app.add_handler(CommandHandler("odfiles", cmd_odfiles))
+    app.add_handler(CommandHandler("odsearch", cmd_odsearch))
+    app.add_handler(CommandHandler("odread", cmd_odread))
     app.add_handler(CommandHandler("properties", cmd_properties))
     app.add_handler(CommandHandler("addproperty", cmd_addproperty))
     app.add_handler(CommandHandler("pick", cmd_pick))
@@ -982,6 +1481,15 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("checkreviews", cmd_checkreviews))
     app.add_handler(CallbackQueryHandler(handle_approval_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # Background search indexer
+    index_interval = config.INDEX_POLL_INTERVAL_MINUTES * 60
+    app.job_queue.run_repeating(
+        _background_index,
+        interval=index_interval,
+        first=60,  # first index 60s after startup
+        name="search_indexer",
+    )
 
     # Background review polling
     if config.GOOGLE_PLACES_API_KEY:
