@@ -41,12 +41,29 @@ TELEGRAM_AUTHORIZED_USER_ID = TELEGRAM_AUTHORIZED_USER_IDS[0]
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.1")
 
+# Agent loop API: "responses" (default — Responses API: reasoning carries across tool rounds,
+# built-in web search) or "chat" (the previous chat.completions loop, kept as a fallback).
+OPENAI_API_MODE = os.getenv("OPENAI_API_MODE", "responses").strip().lower()
+# Reasoning effort for the Responses loop ("none" | "low" | "medium" | "high"); low keeps chat snappy
+OPENAI_REASONING_EFFORT = os.getenv("OPENAI_REASONING_EFFORT", "low").strip().lower()
+# Built-in web search tool in the Responses loop (set 0 to turn browsing off)
+WEB_SEARCH_ENABLED = os.getenv("WEB_SEARCH_ENABLED", "1") not in ("0", "false", "no")
+
+# Image generation (the generate_image tool)
+IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gpt-image-1")
+IMAGE_QUALITY = os.getenv("IMAGE_QUALITY", "medium")
+
 # Semantic search embeddings
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
 EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "512"))
 
 # Voice note transcription
 VOICE_MODEL = os.getenv("VOICE_MODEL", "gpt-4o-mini-transcribe")
+
+# Spoken replies (text-to-speech): model, voice, and the longest answer that is read aloud
+VOICE_OUT_MODEL = os.getenv("VOICE_OUT_MODEL", "gpt-4o-mini-tts")
+VOICE_OUT_VOICE = os.getenv("VOICE_OUT_VOICE", "alloy")
+VOICE_OUT_MAX_CHARS = int(os.getenv("VOICE_OUT_MAX_CHARS", "1500"))
 
 # Morning digest (local hour; set DIGEST_ENABLED=0 to turn off)
 DIGEST_ENABLED = os.getenv("DIGEST_ENABLED", "1") not in ("0", "false", "no")
@@ -67,12 +84,17 @@ MAX_PARALLEL_TOOLS = int(os.getenv("MAX_PARALLEL_TOOLS", "4"))
 
 # Prices in USD per 1M tokens, used by /usage. PLACEHOLDERS — check platform.openai.com/pricing
 # and update; unknown models are recorded with cost 0 and flagged in /usage.
+# Two non-token entries: "per_image" is USD per generated image (the image model's usage row
+# stores the image count in completion_tokens), and the TTS model is priced per character —
+# its "in" figure is USD per 1M *characters* (the usage row stores characters in prompt_tokens).
 PRICES_PER_MTOK: dict[str, dict[str, float]] = {
     "gpt-5.1": {"in": 1.25, "cached": 0.125, "out": 10.0},
     "gpt-5-mini": {"in": 0.25, "cached": 0.025, "out": 2.0},
     "text-embedding-3-small": {"in": 0.02, "cached": 0.02, "out": 0.0},
     "gpt-4o-mini-transcribe": {"in": 1.25, "cached": 1.25, "out": 5.0},
     "whisper-1": {"in": 0.0, "cached": 0.0, "out": 0.0},  # billed per minute, not tokens
+    "gpt-image-1": {"per_image": 0.04},                   # per image (1024x1024, medium quality)
+    "gpt-4o-mini-tts": {"in": 15.0, "cached": 15.0, "out": 0.0},  # per 1M characters (~$0.015/min)
 }
 
 # Max output tokens per LLM response
@@ -122,8 +144,13 @@ IMESSAGE_DB_PATH = os.getenv("IMESSAGE_DB_PATH", "")
 # iMessage backfill page size (rows per batch while walking the whole chat.db)
 IMESSAGE_BATCH_SIZE = int(os.getenv("IMESSAGE_BATCH_SIZE", "2000"))
 
-# Cheap model for internal calls (urgency triage, short drafts)
+# Cheap model for internal calls (urgency triage, short drafts, memory extraction, summaries)
 OPENAI_FAST_MODEL = os.getenv("OPENAI_FAST_MODEL", "gpt-5-mini")
+
+# Memory 2.0: extract durable facts from every turn with the fast model (set 0 to turn off;
+# the explicit `remember` tool keeps working), and how many memories are picked by relevance
+MEMORY_AUTO_EXTRACT = os.getenv("MEMORY_AUTO_EXTRACT", "1") not in ("0", "false", "no")
+MEMORY_TOP_K = int(os.getenv("MEMORY_TOP_K", "12"))
 
 # Urgent inbound alerts: poll cadence, quiet hours (local, "23-7" = 23:00–07:00), max item age
 ALERTS_ENABLED = os.getenv("ALERTS_ENABLED", "1") not in ("0", "false", "no")

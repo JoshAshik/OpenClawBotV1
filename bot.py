@@ -12,6 +12,7 @@ Outbound actions (send email, send message) go through the approval flow:
 """
 
 import asyncio
+import io
 import json
 import logging
 import time
@@ -75,6 +76,8 @@ _TOOL_LABELS = {
     "list_reminders": "⏰ Checking reminders",
     "cancel_reminder": "⏰ Cancelling a reminder",
     "remember": "💾 Saving to memory",
+    "generate_image": "🎨 Generating an image",
+    "web_search": "🌐 Searching the web",
 }
 
 
@@ -274,8 +277,10 @@ async def _handle_draft_edit(context: ContextTypes.DEFAULT_TYPE, user_id: int, i
         pass
 
 
-async def _run_agent_turn(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int, user_text: str) -> None:
-    """Shared free-text pipeline, one turn at a time per user (see _TURN_LOCKS)."""
+async def _run_agent_turn(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int, user_text: str,
+                          incoming_voice: bool = False) -> None:
+    """Shared free-text pipeline, one turn at a time per user (see _TURN_LOCKS).
+    incoming_voice marks a transcribed voice note, which /voice auto answers by voice."""
     lock = _TURN_LOCKS.setdefault(user_id, asyncio.Lock())
     if lock.locked():
         try:
@@ -283,12 +288,52 @@ async def _run_agent_turn(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user
         except Exception:
             pass
     async with lock:
-        await _run_agent_turn_locked(context, chat_id, user_id, user_text)
+        await _run_agent_turn_locked(context, chat_id, user_id, user_text, incoming_voice)
+
+
+async def _send_files(bot, chat_id: int, files: list[dict]) -> None:
+    """Send generated attachments (today: photos from generate_image) after the answer."""
+    for f in files or []:
+        data = f.get("bytes")
+        if not data:
+            continue
+        caption = (f.get("caption") or "")[:1024] or None
+        name = f.get("filename") or "image.png"
+
+        def _buf():  # a fresh buffer per attempt, so a flood-control retry doesn't send an empty file
+            b = io.BytesIO(data)
+            b.name = name
+            return b
+
+        try:
+            if f.get("kind", "photo") == "photo":
+                await tg_retry(lambda: bot.send_photo(chat_id=chat_id, photo=_buf(), caption=caption))
+            else:
+                await tg_retry(lambda: bot.send_document(chat_id=chat_id, document=_buf(), caption=caption))
+        except Exception:
+            logger.exception("Sending a generated file failed")
+
+
+async def _send_voice_reply(bot, chat_id: int, text: str) -> None:
+    """Speak the final answer as a Telegram voice note (after the text, never instead of it)."""
+    try:
+        audio = await llm.synthesize_speech(text)
+        if not audio:
+            return
+        def _buf():
+            b = io.BytesIO(audio)
+            b.name = "reply.ogg"
+            return b
+
+        await tg_retry(lambda: bot.send_voice(chat_id=chat_id, voice=_buf()))
+    except Exception:
+        logger.exception("Voice reply failed")
 
 
 async def _run_agent_turn_locked(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int,
-                                 user_text: str) -> None:
-    """status message → agent (bounded by TURN_TIMEOUT_SECONDS) → final render → approvals."""
+                                 user_text: str, incoming_voice: bool = False) -> None:
+    """status message → agent (bounded by TURN_TIMEOUT_SECONDS) → final render → files →
+    voice note (per /voice) → approvals."""
     await db.log_audit("chat", "read", f"User message ({len(user_text)} chars)",
                        user_id=user_id, approved=True)
 
@@ -314,6 +359,15 @@ async def _run_agent_turn_locked(context: ContextTypes.DEFAULT_TYPE, chat_id: in
         return
 
     await status.finish(result["text"])
+    await _send_files(context.bot, chat_id, result.get("files") or [])
+
+    if result.get("text") and result["text"] != llm.RAN_OUT_TEXT:
+        try:
+            mode = await llm.voice_mode()
+        except Exception:
+            mode = "auto"
+        if llm.should_speak(mode, incoming_voice, llm.wants_spoken_reply(user_text)):
+            await _send_voice_reply(context.bot, chat_id, result["text"])
 
     for action in result.get("actions", []):
         await request_approval(
@@ -359,16 +413,19 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "  \"Find the lease for 123 Oak St\"\n"
         "  \"Any new reviews on my properties?\"\n"
         "  \"Reply to John's email saying I'll be there Monday\"\n\n"
-        "I'll search emails, read PDFs, check reviews, and more — "
-        "automatically. Sending anything always requires your approval, "
+        "I'll search emails, read PDFs, check reviews, browse the web, make images "
+        "(\"draw a flyer for the open house\"), and more — automatically. Say \"say it\" "
+        "to hear an answer out loud. Sending anything always requires your approval, "
         "and every draft card has an ✏️ Edit button for revisions.\n\n"
         "*Conversation*\n"
         "/new — Start a fresh conversation\n"
-        "/memories — Show long-term memories\n"
+        "/memories — Long-term memories (saved + auto-learned) and recent conversation summaries\n"
+        "/summaries — Summaries of earlier conversations\n"
         "/reminders — Pending reminders (\"remind me Friday to…\" sets one)\n"
         "/waiting — Sent emails/texts with no reply, with Nudge buttons\n"
         "/alerts [on|off] — Urgent inbound alerts status, watch-list, last alerts\n"
         "/forget `<id>` — Delete a memory\n"
+        "/voice [on|off|auto] — Spoken replies: always, never, or only to voice notes\n"
         "/cancel — Cancel an in-progress draft edit\n\n"
         "*Email*\n"
         "/signature `<account> <text>` — Set a per-account signature\n\n"
@@ -441,7 +498,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         spend = "n/a"
     await update.message.reply_text(
         f"*Clawdbot Status*\n\n"
-        f"Model: `{config.OPENAI_MODEL}` (fast: `{config.OPENAI_FAST_MODEL}`)\n"
+        f"Model: `{config.OPENAI_MODEL}` (fast: `{config.OPENAI_FAST_MODEL}`, "
+        f"API: {config.OPENAI_API_MODE}, reasoning: {config.OPENAI_REASONING_EFFORT})\n"
         f"Spend today: {spend} — /usage for the breakdown\n"
         f"Uptime: {ops.uptime_str()} (since {started})\n"
         f"Session: {'unlocked' if security.is_session_unlocked() else 'LOCKED'}\n"
@@ -2188,20 +2246,91 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("✨ Fresh conversation started. Long-term memories are kept.")
 
 
-@auth_required
-async def cmd_memories(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    memories = await db.list_memories(limit=30)
-    if not memories:
-        await update.message.reply_text(
-            "No memories saved yet. Tell me things like \"remember to sign my emails as Josh\"."
-        )
-        return
-    lines = ["*Long-term memory*\n"]
+def _memory_lines(memories: list[dict]) -> list[str]:
+    lines = []
     for m in memories:
         cat = f" ({m['category']})" if m["category"] else ""
-        lines.append(f"`#{m['id']}`{cat} {m['content']}")
-    lines.append("\nForget one with /forget `<id>`")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        lines.append(f"`#{m['id']}`{cat} {_md_escape(m['content'])}")
+    return lines
+
+
+def _md_escape(text: str) -> str:
+    """Neutralize the few characters that break Telegram's legacy Markdown mode."""
+    return text.replace("_", "\\_").replace("*", "\\*").replace("`", "'")
+
+
+@auth_required
+async def cmd_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/voice [on|off|auto] — spoken replies always / never / only to voice notes (persisted)."""
+    arg = (context.args[0].lower() if context.args else "").strip()
+    if arg in llm.VOICE_MODES:
+        await db.set_setting(llm.VOICE_SETTING, arg)
+        mode = arg
+    elif arg:
+        await update.message.reply_text("Usage: /voice on | off | auto")
+        return
+    else:
+        mode = await llm.voice_mode()
+    desc = {
+        "on": "every answer also comes as a voice note",
+        "off": "answers are text only (\"say it\" still reads one aloud)",
+        "auto": "voice notes get a spoken answer; typed messages get text",
+    }[mode]
+    await update.message.reply_text(
+        f"🔊 Voice replies: *{mode}* — {desc}.\nVoice: `{config.VOICE_OUT_VOICE}` ({config.VOICE_OUT_MODEL})",
+        parse_mode="Markdown",
+    )
+
+
+@auth_required
+async def cmd_memories(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    explicit = await db.list_memories(limit=30, source="explicit")
+    auto = await db.list_memories(limit=30, source="auto")
+    summaries = await db.list_session_summaries(limit=3)
+    if not explicit and not auto and not summaries:
+        await update.message.reply_text(
+            "No memories yet. Tell me things like \"remember to sign my emails as Josh\" — "
+            "I also pick up durable facts from our conversations automatically."
+        )
+        return
+    lines = ["*Long-term memory*"]
+    if explicit:
+        lines.append("\n*Saved on request*")
+        lines.extend(_memory_lines(explicit))
+    if auto:
+        lines.append("\n*Learned from conversations*")
+        lines.extend(_memory_lines(auto))
+    if summaries:
+        lines.append("\n*Recent conversations*")
+        for sm in summaries:
+            lines.append(f"`{sm['created_at'][:10]}` {_md_escape(sm['summary'][:300])}")
+        lines.append("More with /summaries")
+    lines.append("\nForget a memory with /forget `<id>`")
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:3990] + "\n…"
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+@auth_required
+async def cmd_summaries(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Episodic memory: what earlier conversations were about (memory.summarize_turns)."""
+    summaries = await db.list_session_summaries(limit=10)
+    if not summaries:
+        await update.message.reply_text(
+            "No conversation summaries yet — one is written when a conversation ends "
+            "(/new or idle reset) or grows past the history budget."
+        )
+        return
+    lines = ["*Earlier conversations*\n"]
+    for sm in summaries:
+        ents = ", ".join(sm["entities"][:6])
+        lines.append(f"`{sm['created_at'][:16].replace('T', ' ')}` {_md_escape(sm['summary'])}"
+                     + (f"\n  _{_md_escape(ents)}_" if ents else ""))
+    text = "\n\n".join(lines)
+    if len(text) > 4000:
+        text = text[:3990] + "\n…"
+    await update.message.reply_text(text, parse_mode="Markdown")
 
 
 @auth_required
@@ -2258,7 +2387,8 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if update.effective_user.id in _EDIT_STATE:
         await _handle_draft_edit(context, update.effective_user.id, transcript)
         return
-    await _run_agent_turn(context, update.effective_chat.id, update.effective_user.id, transcript)
+    await _run_agent_turn(context, update.effective_chat.id, update.effective_user.id, transcript,
+                          incoming_voice=True)
 
 
 def _extract_pdf_bytes(data: bytes) -> str:
@@ -2392,7 +2522,9 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("restart", cmd_restart))
     app.add_handler(CommandHandler("audit", cmd_audit))
     app.add_handler(CommandHandler("new", cmd_new))
+    app.add_handler(CommandHandler("voice", cmd_voice))
     app.add_handler(CommandHandler("memories", cmd_memories))
+    app.add_handler(CommandHandler("summaries", cmd_summaries))
     app.add_handler(CommandHandler("reminders", cmd_reminders))
     app.add_handler(CommandHandler("waiting", cmd_waiting))
     app.add_handler(CommandHandler("alerts", cmd_alerts))

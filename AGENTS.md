@@ -44,10 +44,29 @@ Guidance for AI-assisted work on Clawdbot — a single-user Telegram assistant b
    `StatusMessage` (one Telegram message that shows tool steps, streams the answer, then becomes
    the final HTML-rendered reply via `telegram_format.markdown_to_telegram_html`).
 2. **llm.py** — streaming OpenAI agent loop (`agent_chat`). Builds a dynamic system prompt
-   (date/time, Gmail accounts, memories, signatures, working set of recently referenced ids),
-   replays token-budgeted history, runs up to 10 tool rounds, persists the turn.
+   (date/time, Gmail accounts, memories, session summaries, signatures, working set of recently
+   referenced ids), replays token-budgeted history, runs up to 10 tool rounds, persists the turn.
+   `build_system_prompt(user_message)` takes the user's message so memories can be picked by
+   relevance; `compact_history` is applied to the replayed history (see 15).
+   `_openai_agent_loop` dispatches on `config.OPENAI_API_MODE`: **`responses`** (default) is
+   `_responses_agent_loop` — `client.responses.create(stream=True)` with the system prompt as
+   `instructions`, the stored turns mapped by `_to_responses_input` (user/assistant text,
+   `function_call` / `function_call_output` items keyed by the stored tool_use id), our
+   function tools from `agent_tools.get_responses_tools()` (strict where every property is
+   required) plus the built-in `web_search` tool, `reasoning.effort` from
+   `OPENAI_REASONING_EFFORT`, and `previous_response_id` chaining so later rounds send only the
+   `function_call_output` items and reasoning state carries across tool rounds. Text deltas
+   stream to `on_text`, function calls are read from the completed response, usage from its
+   `usage`, and `url_citation` annotations become markdown links via `render_citations`.
+   **`chat`** is the old chat.completions loop (`_chat_agent_loop`, `_to_openai_messages`), kept
+   as a reversible fallback with no web search. Both return the same
+   `(result, turn_norm, entities, totals)`; `result` is `{text, actions, files}`.
 3. **agent_tools.py** — tool schemas + execution. Read tools return `result` (+ `entities` for the
    working set); write tools return `action` payloads. `action_detail()` renders approval cards.
+   `generate_image` (read tool, not outbound) calls `llm.generate_image` (gpt-image-1) and returns
+   `files` = `[{kind: photo, bytes, filename, caption}]`, which `_run_tools` collects into the
+   loop's `files` sink and `bot._send_files` sends as Telegram photos after the answer. Web
+   images are only ever returned as links (prompt rule), never downloaded.
 4. **search_index.py / embeddings.py / indexer.py** — `hybrid_search` = FTS5 BM25 (sanitized
    queries, LIKE fallback) + embedding cosine (numpy over 512-dim vectors stored in SQLite),
    merged by reciprocal-rank fusion with a recency boost. `indexer` runs incremental Gmail sync
@@ -91,19 +110,50 @@ Guidance for AI-assisted work on Clawdbot — a single-user Telegram assistant b
 13. **Engine notes** — `llm._run_tools` runs read tools in parallel (semaphore
     `MAX_PARALLEL_TOOLS`) and `WRITE_TOOLS` sequentially, preserving call order; add any new
     state-changing tool to `llm.WRITE_TOOLS`. Every OpenAI call must go through
-    `llm.record_usage(purpose, model, response.usage)` (streaming: pass
-    `stream_options={"include_usage": True}` and read the final chunk's `usage`); costs come from
-    `config.PRICES_PER_MTOK`, which the owner keeps in sync with OpenAI pricing.
+    `llm.record_usage(purpose, model, response.usage)` (Responses stream: the
+    `response.completed` event's `usage`; chat stream: pass `stream_options={"include_usage":
+    True}` and read the final chunk's `usage`); costs come from `config.PRICES_PER_MTOK`, which
+    the owner keeps in sync with OpenAI pricing. Non-token entries: `per_image` (purpose
+    `image`, count in completion_tokens) and the TTS model priced per character (purpose `tts`,
+    characters in prompt_tokens).
+    **Spoken replies:** `bot._run_agent_turn(..., incoming_voice=True)` marks transcribed voice
+    notes; after the text reply, `llm.should_speak(mode, incoming_voice, say_it)` (mode from
+    `/voice on|off|auto` in `settings.voice_reply_mode`, `say_it` from `llm.wants_spoken_reply`)
+    decides whether `llm.synthesize_speech` (markdown stripped, ≤ `VOICE_OUT_MAX_CHARS`, Ogg/Opus
+    from `VOICE_OUT_MODEL`) is sent as a Telegram voice note. Not outbound — owner only.
 14. **Resilience rules** — every OpenAI call goes through `llm.with_retry(lambda: ..., purpose)`;
     every Telegram send/edit outside a handler's direct reply goes through
     `telegram_format.tg_retry`; agent turns run under `bot._TURN_LOCKS[user]` with
     `TURN_TIMEOUT_SECONDS`; the DB is WAL (`db.apply_pragmas`) — never set journal_mode elsewhere.
+15. **memory.py — the memory pipeline (Memory 2.0).** Three layers, all on the fast model and
+    `embeddings.embed_texts`, none on the reply's critical path (`llm._background` =
+    fire-and-forget task; tests patch it to await inline):
+    - *Extraction:* after `save_turn`, `memory.extract_and_store(user_message, answer)` asks
+      `OPENAI_FAST_MODEL` (strict json_schema) for 0–3 durable facts and dedupes each against
+      `memory_embeddings` by cosine: ≥ 0.92 skip, 0.80–0.92 merge (short LLM rewrite keeps the
+      newer detail, row updated in place), else insert with `memories.source='auto'`. The
+      `remember` tool still exists (`source='explicit'`, stored via `memory.store_memory` so it
+      is embedded too). `MEMORY_AUTO_EXTRACT=0` turns extraction off.
+    - *Retrieval:* `memory.select_memories(query)` = top `MEMORY_TOP_K` (12) by similarity to the
+      current message + the 5 newest, 2000-char cap; falls back to the newest 30 without
+      embeddings. Memories without a vector are embedded lazily (`ensure_embeddings`).
+    - *Episodic:* `memory.summarize_turns` writes a `session_summaries` row (≤ 120 words + key
+      entities) for turns that `db.get_turn_messages_with_dropped` dropped from the budget and,
+      via `memory.close_session`, for a session replaced by `/new` or the idle reset.
+      `settings.summarized_through:<session>` stops re-summarizing the same turns. The prompt
+      shows the 3 newest under "EARLIER CONVERSATIONS"; `/memories` and `/summaries` list them.
+    - *Compaction rule:* `llm.compact_history` truncates `tool_results` content older than the
+      2 most recent user turns to 400 chars + `[truncated — ask again to re-read]` **in the
+      copy sent to the model only**: no message is removed, no `tool_use_id` changes, and
+      `chat_turns` keeps the full results. Memory work is not outbound — no approval flow.
 
 ## Conversation storage
 
 `chat_turns.messages_json` holds provider-neutral messages:
 `{role: user, content: str}` · `{role: assistant, content: [text | tool_use blocks]}` ·
-`{role: tool_results, content: [{tool_use_id, content}]}` — converted to the OpenAI wire format in
+`{role: tool_results, content: [{tool_use_id, content}]}` — converted per request to Responses
+`input` items by `llm._to_responses_input` (the tool_use id becomes `call_id` on both the
+`function_call` and its `function_call_output`) or to the chat wire format by
 `llm._to_openai_messages`. When trimming history, drop **whole turns** only, never split a
 tool_use from its tool_results.
 

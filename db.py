@@ -94,8 +94,26 @@ async def _init_tables(db: aiosqlite.Connection) -> None:
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             created_at  TEXT    NOT NULL,
             category    TEXT,
-            content     TEXT    NOT NULL
+            content     TEXT    NOT NULL,
+            source      TEXT    NOT NULL DEFAULT 'explicit'
         );
+
+        CREATE TABLE IF NOT EXISTS memory_embeddings (
+            memory_id   INTEGER PRIMARY KEY,
+            model       TEXT    NOT NULL,
+            dim         INTEGER NOT NULL,
+            vector      BLOB    NOT NULL,
+            updated_at  TEXT    NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS session_summaries (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id    TEXT    NOT NULL,
+            created_at    TEXT    NOT NULL,
+            summary       TEXT    NOT NULL,
+            entities_json TEXT    NOT NULL DEFAULT '[]'
+        );
+        CREATE INDEX IF NOT EXISTS idx_session_summaries_session ON session_summaries(session_id, id);
 
         CREATE TABLE IF NOT EXISTS contacts (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -174,7 +192,16 @@ async def _init_tables(db: aiosqlite.Connection) -> None:
     """)
     await _migrate_contacts(db)
     await _migrate_chat_turns(db)
+    await _migrate_memories(db)
     await db.commit()
+
+
+async def _migrate_memories(db: aiosqlite.Connection) -> None:
+    """Memories saved before auto-extraction existed are all explicit (`remember` tool)."""
+    cursor = await db.execute("PRAGMA table_info(memories)")
+    cols = {r[1] for r in await cursor.fetchall()}
+    if "source" not in cols:
+        await db.execute("ALTER TABLE memories ADD COLUMN source TEXT NOT NULL DEFAULT 'explicit'")
 
 
 async def _migrate_chat_turns(db: aiosqlite.Connection) -> None:
@@ -349,34 +376,66 @@ async def top_turns(since_iso: str, limit: int = 5) -> list[dict]:
     return turns
 
 
-async def get_turn_messages(session_id: str, token_budget: int) -> list[dict]:
+async def get_turn_messages_with_dropped(session_id: str, token_budget: int
+                                         ) -> tuple[list[dict], list[dict]]:
     """
-    Return the normalized message list for a session, newest turns first
-    until the token budget is filled, then flattened back to chronological order.
+    Return (messages, dropped_turns) for a session: the normalized message list of the
+    newest turns that fit the token budget (chronological), plus the turns that did NOT
+    fit as [{"id", "role", "messages"}] (chronological) so the caller can summarize them.
     Whole turns are kept or dropped — never split (keeps tool_use/tool_result pairs valid).
     """
     db = await get_db()
     cursor = await db.execute(
-        "SELECT messages_json, est_tokens FROM chat_turns WHERE session_id = ? ORDER BY id DESC",
+        "SELECT id, role, messages_json, est_tokens FROM chat_turns WHERE session_id = ? ORDER BY id DESC",
         (session_id,),
     )
     rows = await cursor.fetchall()
 
     kept: list[list[dict]] = []
+    dropped: list[dict] = []
     used = 0
+    full = False
     for r in rows:
-        if used + r["est_tokens"] > token_budget and kept:
-            break
+        if not full and used + r["est_tokens"] > token_budget and kept:
+            full = True
         try:
-            kept.append(json.loads(r["messages_json"]))
+            msgs = json.loads(r["messages_json"])
         except json.JSONDecodeError:
             continue
+        if full:
+            dropped.append({"id": r["id"], "role": r["role"], "messages": msgs})
+            continue
+        kept.append(msgs)
         used += r["est_tokens"]
 
     messages: list[dict] = []
     for turn in reversed(kept):
         messages.extend(turn)
+    dropped.reverse()
+    return messages, dropped
+
+
+async def get_turn_messages(session_id: str, token_budget: int) -> list[dict]:
+    """Normalized messages for a session within the token budget (see the _with_dropped variant)."""
+    messages, _ = await get_turn_messages_with_dropped(session_id, token_budget)
     return messages
+
+
+async def get_session_turns(session_id: str, after_id: int = 0) -> list[dict]:
+    """Every turn of a session with id > after_id, chronological: [{"id", "role", "timestamp", "messages"}]."""
+    db = await get_db()
+    cursor = await db.execute(
+        "SELECT id, role, timestamp, messages_json FROM chat_turns WHERE session_id = ? AND id > ? ORDER BY id",
+        (session_id, after_id),
+    )
+    out = []
+    for r in await cursor.fetchall():
+        try:
+            msgs = json.loads(r["messages_json"])
+        except json.JSONDecodeError:
+            continue
+        out.append({"id": r["id"], "role": r["role"], "timestamp": r["timestamp"], "messages": msgs})
+    return out
 
 
 async def get_last_turn_time(session_id: str) -> datetime | None:
@@ -395,35 +454,118 @@ async def get_last_turn_time(session_id: str) -> datetime | None:
 
 
 # ── Long-Term Memories ────────────────────────────────────────────
+#
+# `source` is 'explicit' (the model's `remember` tool / the user) or 'auto' (extracted by
+# memory.py after a turn). memory_embeddings holds one normalized vector per memory for
+# relevance-based retrieval and dedupe; session_summaries are the episodic layer.
 
-async def add_memory(content: str, category: str | None = None) -> int:
+def _memory_row(r) -> dict:
+    return {"id": r["id"], "created_at": r["created_at"], "category": r["category"],
+            "content": r["content"], "source": r["source"] if "source" in r.keys() else "explicit"}
+
+
+async def add_memory(content: str, category: str | None = None, source: str = "explicit") -> int:
     db = await get_db()
     cursor = await db.execute(
-        "INSERT INTO memories (created_at, category, content) VALUES (?, ?, ?)",
-        (datetime.now(timezone.utc).isoformat(), category, content),
+        "INSERT INTO memories (created_at, category, content, source) VALUES (?, ?, ?, ?)",
+        (datetime.now(timezone.utc).isoformat(), category, content, source),
     )
     await db.commit()
     return cursor.lastrowid
 
 
-async def list_memories(limit: int = 50) -> list[dict]:
+async def get_memory(memory_id: int) -> dict | None:
+    db = await get_db()
+    cursor = await db.execute("SELECT * FROM memories WHERE id = ?", (memory_id,))
+    row = await cursor.fetchone()
+    return _memory_row(row) if row else None
+
+
+async def update_memory(memory_id: int, content: str, category: str | None = None) -> bool:
+    """Rewrite a memory in place (merge of an auto-extracted near-duplicate); drops its stale vector."""
     db = await get_db()
     cursor = await db.execute(
-        "SELECT id, created_at, category, content FROM memories ORDER BY id DESC LIMIT ?",
-        (limit,),
+        "UPDATE memories SET content = ?, category = COALESCE(?, category), created_at = ? WHERE id = ?",
+        (content, category, datetime.now(timezone.utc).isoformat(), memory_id),
     )
-    rows = await cursor.fetchall()
-    return [
-        {"id": r["id"], "created_at": r["created_at"], "category": r["category"], "content": r["content"]}
-        for r in rows
-    ]
+    await db.execute("DELETE FROM memory_embeddings WHERE memory_id = ?", (memory_id,))
+    await db.commit()
+    return cursor.rowcount > 0
+
+
+async def list_memories(limit: int = 50, source: str | None = None) -> list[dict]:
+    db = await get_db()
+    if source:
+        cursor = await db.execute(
+            "SELECT * FROM memories WHERE source = ? ORDER BY id DESC LIMIT ?", (source, limit))
+    else:
+        cursor = await db.execute("SELECT * FROM memories ORDER BY id DESC LIMIT ?", (limit,))
+    return [_memory_row(r) for r in await cursor.fetchall()]
 
 
 async def delete_memory(memory_id: int) -> bool:
     db = await get_db()
     cursor = await db.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
+    await db.execute("DELETE FROM memory_embeddings WHERE memory_id = ?", (memory_id,))
     await db.commit()
     return cursor.rowcount > 0
+
+
+async def store_memory_embedding(memory_id: int, vector: bytes, model: str, dim: int) -> None:
+    db = await get_db()
+    now = datetime.now(timezone.utc).isoformat()
+    await db.execute(
+        "INSERT INTO memory_embeddings (memory_id, model, dim, vector, updated_at) VALUES (?, ?, ?, ?, ?) "
+        "ON CONFLICT(memory_id) DO UPDATE SET model = ?, dim = ?, vector = ?, updated_at = ?",
+        (memory_id, model, dim, vector, now, model, dim, vector, now),
+    )
+    await db.commit()
+
+
+async def load_memory_embeddings() -> list[tuple[int, int, bytes]]:
+    """[(memory_id, dim, vector_bytes)] for every memory that still exists."""
+    db = await get_db()
+    cursor = await db.execute(
+        "SELECT e.memory_id, e.dim, e.vector FROM memory_embeddings e "
+        "JOIN memories m ON m.id = e.memory_id ORDER BY e.memory_id")
+    return [(r["memory_id"], r["dim"], r["vector"]) for r in await cursor.fetchall()]
+
+
+async def memories_without_embedding(limit: int = 200) -> list[dict]:
+    db = await get_db()
+    cursor = await db.execute(
+        "SELECT m.* FROM memories m LEFT JOIN memory_embeddings e ON e.memory_id = m.id "
+        "WHERE e.memory_id IS NULL ORDER BY m.id LIMIT ?", (limit,))
+    return [_memory_row(r) for r in await cursor.fetchall()]
+
+
+# ── Session summaries (episodic memory) ───────────────────────────
+
+async def add_session_summary(session_id: str, summary: str, entities: list[str]) -> int:
+    db = await get_db()
+    cursor = await db.execute(
+        "INSERT INTO session_summaries (session_id, created_at, summary, entities_json) VALUES (?, ?, ?, ?)",
+        (session_id, datetime.now(timezone.utc).isoformat(), summary,
+         json.dumps(list(entities or []), ensure_ascii=False)),
+    )
+    await db.commit()
+    return cursor.lastrowid
+
+
+async def list_session_summaries(limit: int = 3) -> list[dict]:
+    db = await get_db()
+    cursor = await db.execute(
+        "SELECT id, session_id, created_at, summary, entities_json FROM session_summaries "
+        "ORDER BY id DESC LIMIT ?", (limit,))
+    out = []
+    for r in await cursor.fetchall():
+        try:
+            entities = json.loads(r["entities_json"] or "[]")
+        except json.JSONDecodeError:
+            entities = []
+        out.append({"id": r["id"], "session_id": r["session_id"], "created_at": r["created_at"],
+                    "summary": r["summary"], "entities": entities})
+    return out
 
 
 # ── Reminders (not outbound: they only ever message the owner) ──

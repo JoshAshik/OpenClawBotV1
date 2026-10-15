@@ -11,8 +11,10 @@ the machine); WhatsApp is **read-only**; after messaging, **proactivity** comes 
 ## Where things stand (updated 2026-10-15, commit 1c8566c)
 
 - **Everything buildable off the Mac is built, tested and pushed** (`main` at 1c8566c, 178 tests,
-  `pytest -q`). Done: Phase 7 ops code, Phase 8 except WhatsApp schema hardening, Phase 9 except
-  the Responses API migration, Phase 10 except Apple Calendar. Phases 11 and 12 are untouched.
+  `pytest -q`). Done: Phase 7 ops code, Phase 8 except WhatsApp schema hardening, Phase 9
+  (the Responses API migration landed in the working tree after this push, with web search,
+  image generation and spoken replies — Phase 13), Phase 10 except Apple Calendar. Phases 11
+  and 12 are untouched.
 - **What still needs the Mac mini itself** (see `deploy/MAC_SETUP.md`): install + launchd, the
   Google OAuth "In production" flip and `/addaccount` re-auth, Full Disk Access / Automation
   grants, the reboot test; then verifying the real `chat.db` reader, the WhatsApp schema, the
@@ -131,11 +133,16 @@ the machine); WhatsApp is **read-only**; after messaging, **proactivity** comes 
       under a `MAX_PARALLEL_TOOLS` (4) semaphore, then the `WRITE_TOOLS` (draft/reply/send,
       remember, reminders) one at a time, and emits results in the original call order so
       tool_use/tool_results pairing is untouched; a crashing tool becomes a "Tool failed" result.
-- [ ] **Responses API migration** for the agent loop: native for GPT-5.x, reasoning state carries
-      across tool rounds (better multi-step tool use), server-side prompt caching. Keep the
-      provider-neutral `chat_turns` format; only `_to_openai_messages` and the loop change.
-      Expose `OPENAI_REASONING_EFFORT` (default `low` for chat latency) and `OPENAI_FAST_MODEL`
-      (`gpt-5-mini`-class) for internal calls: draft revision, digest, image OCR, urgency triage.
+- [x] **Responses API migration** for the agent loop: `llm._responses_agent_loop` streams
+      `client.responses.create` with `instructions`, the stored turns as `input`
+      (`_to_responses_input` keeps tool-call ids as `call_id`), our function tools (strict where
+      the schema allows) plus the built-in `web_search` tool, `reasoning.effort` =
+      `OPENAI_REASONING_EFFORT` (default `low`), and `previous_response_id` chaining so later
+      rounds send only `function_call_output` items and reasoning carries across tool rounds.
+      Usage comes from the `response.completed` event; citations become markdown links. The
+      provider-neutral `chat_turns` format is unchanged, and `OPENAI_API_MODE=chat` reverts to the
+      old chat.completions loop. `OPENAI_FAST_MODEL` (`gpt-5-mini`) already serves the internal
+      calls. 9 tests in `tests/test_responses.py`.
 - [x] **Strict structured outputs:** `llm.revise_draft` sends a strict `json_schema` built from
       `_EDITABLE_FIELDS` (`llm.schema_for`), so a reply/text revision cannot even return a
       recipient; falls back to `json_object` if the API rejects the schema. Urgency triage was
@@ -244,6 +251,38 @@ the machine); WhatsApp is **read-only**; after messaging, **proactivity** comes 
 - [ ] Watchdog: in-bot heartbeat; if Telegram polling has errored for > 5 min, exit so launchd
       restarts; weekly `VACUUM` + integrity check in the backup job.
 - [ ] Audit-log retention (keep 1 year), `/lock` auto-arm after N idle hours (optional).
+
+## Phase 13 — Chat-client parity
+
+Closing the gaps the owner noticed next to the ChatGPT client (2026-10-15).
+
+- [x] **Memory 2.0** (`memory.py`, 21 tests in `tests/test_memory.py`): durable facts are
+      extracted from every turn by the fast model (strict JSON, 0–3 facts, `MEMORY_AUTO_EXTRACT`)
+      and deduped against embedded memories (≥ 0.92 skip, 0.80–0.92 merge keeping the newer
+      detail; `memories.source` = explicit | auto); the prompt carries the top-12 memories by
+      similarity to the current message plus the 5 newest instead of the latest 30; turns that
+      fall out of the history budget and sessions closed by `/new` or the idle reset are summarized
+      into `session_summaries` (≤ 120 words + entities) and the 3 newest ride in the prompt as
+      "EARLIER CONVERSATIONS" (`/summaries`, `/memories` shows auto vs explicit); tool results
+      older than the two most recent turns are compacted to 400 chars before being sent, so the
+      same budget holds more conversation. Live-only check: watch `/usage` purposes `memory`,
+      `memory_merge`, `summary` for a few days and tune the thresholds if auto memories get noisy.
+- [x] **Browsing:** the Responses loop (Phase 9) carries OpenAI's built-in `web_search` tool
+      (`WEB_SEARCH_ENABLED`); the status message shows "🌐 Searching the web", and
+      `url_citation` annotations are rendered as markdown links (inline after the cited span, or
+      a trailing "Sources:" line) so Telegram shows them as links. Pictures found on the web are
+      returned as links only — never downloaded.
+- [x] **Image generation:** `generate_image(prompt, size?)` tool (read tool, not outbound) →
+      `llm.generate_image` (`IMAGE_MODEL` gpt-image-1, `IMAGE_QUALITY`) → PNG bytes in the new
+      `files` result key, sent by `bot._send_files` as a Telegram photo with the prompt as
+      caption. Usage recorded under purpose `image` with a `per_image` price entry.
+- [x] **Spoken replies:** a transcribed voice note (or "say it" / "read it to me", or
+      `/voice on`) gets the final answer back as a voice note after the text —
+      `llm.synthesize_speech` (markdown stripped, ≤ `VOICE_OUT_MAX_CHARS`, `VOICE_OUT_MODEL`
+      gpt-4o-mini-tts, `VOICE_OUT_VOICE`, Ogg/Opus). `/voice on|off|auto` persists the preference
+      in `settings.voice_reply_mode` (auto = voice only to voice). Usage under `tts`, priced per
+      character. Live-only checks: Telegram accepts the Opus container as a voice note; pick a
+      voice the owner likes.
 
 ---
 

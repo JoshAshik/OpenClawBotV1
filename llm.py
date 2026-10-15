@@ -1,13 +1,22 @@
 """
 LLM agent — routes natural language to tool calls automatically.
 
-OpenAI function calling with streaming. Read operations execute immediately;
-write operations return pending actions for the approval flow in bot.py.
+OpenAI function calling with streaming over the Responses API (config.OPENAI_API_MODE
+"responses": reasoning state chained across tool rounds with previous_response_id, built-in
+web search) or the older chat.completions loop ("chat", kept as a reversible fallback).
+Read operations execute immediately; write operations return pending actions for the
+approval flow in bot.py.
 
 Conversation state is structured (Phase 2): every turn's tool calls and full
 tool results are persisted in chat_turns as provider-neutral messages, then
 converted to the OpenAI wire format per request. Sessions auto-reset after
 idle time; /new forces a fresh one.
+
+Memory 2.0 (see memory.py): the system prompt carries the memories most relevant
+to the current message plus the newest, and the 3 most recent session summaries;
+after each turn durable facts are extracted in the background; turns that fall out
+of the history budget (and sessions being closed) are summarized; tool results
+older than the two most recent turns are compacted before they are sent.
 """
 
 import asyncio
@@ -15,7 +24,9 @@ import base64
 import io
 import json
 import logging
+import re
 import time
+from urllib.parse import urlparse
 from datetime import datetime, timedelta, timezone
 
 import openai
@@ -23,7 +34,8 @@ import openai
 import config
 import db
 import gmail_module
-from agent_tools import execute_tool, get_openai_tools
+import memory
+from agent_tools import execute_tool, get_openai_tools, get_responses_tools
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +69,12 @@ def usage_dict(usage) -> dict:
     cached = details.get("cached_tokens") or 0 if isinstance(details, dict) else 0
     if not prompt and not completion and d.get("total_tokens"):
         prompt = d["total_tokens"]  # embeddings report only a total
-    return {"prompt": int(prompt or 0), "cached": int(cached or 0), "completion": int(completion or 0)}
+    out = {"prompt": int(prompt or 0), "cached": int(cached or 0), "completion": int(completion or 0)}
+    if d.get("images"):
+        # Image generation is priced per image: the count rides in completion_tokens (see config).
+        out["images"] = int(d["images"])
+        out["completion"] = out["images"]
+    return out
 
 
 def usage_cost(model: str, u: dict) -> tuple[float, bool]:
@@ -65,6 +82,8 @@ def usage_cost(model: str, u: dict) -> tuple[float, bool]:
     price = config.PRICES_PER_MTOK.get(model)
     if price is None:
         return 0.0, False
+    if "per_image" in price:
+        return round(u.get("images", u["completion"]) * price["per_image"], 8), True
     uncached = max(u["prompt"] - u["cached"], 0)
     cost = (uncached * price.get("in", 0.0) + u["cached"] * price.get("cached", 0.0)
             + u["completion"] * price.get("out", 0.0)) / 1_000_000
@@ -140,10 +159,24 @@ async def with_retry(factory, purpose: str = "openai", attempts: int = RETRY_ATT
             delay *= 2
 
 
+# ── Background work (memory extraction, summaries) ────────────────
+
+_BACKGROUND: set[asyncio.Task] = set()
+
+
+async def _background(coro) -> None:
+    """Fire-and-forget on the running loop; the task set keeps a reference until it finishes.
+    Tests replace this with an awaiting version to make the side effects synchronous."""
+    task = asyncio.create_task(coro)
+    _BACKGROUND.add(task)
+    task.add_done_callback(_BACKGROUND.discard)
+
+
 # ── Sessions ──────────────────────────────────────────────────────
 
 async def get_current_session(force_new: bool = False) -> str:
-    """Return the active session id, starting a fresh one on /new or after idle timeout."""
+    """Return the active session id, starting a fresh one on /new or after idle timeout.
+    A session that is replaced gets summarized in the background (memory.close_session)."""
     session_id = await db.get_setting("current_session_id")
 
     if not force_new and session_id:
@@ -155,9 +188,17 @@ async def get_current_session(force_new: bool = False) -> str:
         # A session with no turns yet stays current.
 
     if force_new or not session_id:
-        session_id = datetime.now(timezone.utc).strftime("s%Y%m%d-%H%M%S")
+        previous = session_id
+        base = datetime.now(timezone.utc).strftime("s%Y%m%d-%H%M%S")
+        session_id = base
+        n = 1
+        while session_id == previous or await db.get_last_turn_time(session_id) is not None:
+            session_id = f"{base}-{n}"  # resets within the same second must not share an id
+            n += 1
         await db.set_setting("current_session_id", session_id)
         await db.set_setting("working_set", "[]")
+        if previous and previous != session_id:
+            await _background(memory.close_session(previous))
 
     return session_id
 
@@ -218,16 +259,20 @@ async def _get_accounts_cached() -> list[dict]:
     return accounts
 
 
-async def build_system_prompt() -> str:
+async def build_system_prompt(user_message: str = "") -> str:
+    """The dynamic system prompt. `user_message` steers which memories are injected
+    (top-K by similarity + the newest); without it the newest memories are used."""
     now = datetime.now().astimezone()
     accounts = await _get_accounts_cached()
     active = gmail_module.get_active_account()
-    memories = await db.list_memories(limit=30)
+    memories = await memory.select_memories(user_message, top_k=config.MEMORY_TOP_K)
+    summaries = await db.list_session_summaries(limit=memory.SUMMARIES_IN_PROMPT)
     working_set = await _get_working_set()
 
     parts = []
 
     owner = f"{config.USER_NAME}'s" if config.USER_NAME else "the user's"
+    web_search_on = config.OPENAI_API_MODE != "chat" and config.WEB_SEARCH_ENABLED
     parts.append(
         f"You are Clawdbot, {owner} personal AI assistant for property management, chatting via Telegram."
     )
@@ -283,7 +328,18 @@ async def build_system_prompt() -> str:
         "follow-up with reply_email (email) or send_imessage (text) — it still needs approval.\n"
         "14. Urgent inbound email/texts are pushed to the user automatically. When they ask to always be "
         "alerted about a contact, property, or topic, save it with remember as 'ALERT: <terms, comma-"
-        "separated>' (e.g. 'ALERT: Unit 4, Mike Plumber, no hot water') — that is the watch-list."
+        "separated>' (e.g. 'ALERT: Unit 4, Mike Plumber, no hot water') — that is the watch-list.\n"
+        + (
+            "15. The web: for news, prices, regulations, how-tos, businesses, or anything not in the "
+            "user's own data, use the built-in web search and cite sources as markdown links. If the "
+            "user wants a picture that already exists online, give its link — never download or "
+            "embed it.\n"
+            if web_search_on else
+            "15. You have no web access in this mode; say so when asked about current events.\n"
+        )
+        + "16. To CREATE a new picture (an illustration, flyer concept, diagram, mockup), call "
+        "generate_image. The image is sent to the user as a photo automatically — reply with one "
+        "short line, don't describe it at length."
     )
 
     signatures = []
@@ -307,11 +363,15 @@ async def build_system_prompt() -> str:
     )
 
     if memories:
-        mem_lines = [f"  #{m['id']}: {m['content']}" for m in memories]
-        mem_text = "\n".join(mem_lines)
-        if len(mem_text) > 2000:
-            mem_text = mem_text[:2000] + "\n  …"
-        parts.append("MEMORY (long-term facts you saved earlier):\n" + mem_text)
+        parts.append("MEMORY (long-term facts about the user, most relevant to this message first):\n"
+                     + memory.format_memories(memories))
+
+    if summaries:
+        parts.append(
+            "EARLIER CONVERSATIONS (summaries of recent sessions; use them to resolve follow-ups "
+            "like 'that email' or 'the plumber from last time', and re-read sources before acting):\n"
+            + memory.format_summaries(summaries)
+        )
 
     if working_set:
         ws_lines = []
@@ -368,17 +428,137 @@ def _to_openai_messages(messages: list[dict]) -> list[dict]:
     return out
 
 
+# ── Tool-result compaction ────────────────────────────────────────
+
+COMPACT_KEEP_TURNS = 2       # the most recent user-initiated turns keep full tool results
+COMPACT_MAX_CHARS = 400
+COMPACT_MARKER = "\n[truncated — ask again to re-read]"
+
+
+def compact_history(messages: list[dict], keep_turns: int = COMPACT_KEEP_TURNS,
+                    max_chars: int = COMPACT_MAX_CHARS) -> list[dict]:
+    """
+    Shrink tool_results content that is older than the `keep_turns` most recent turns
+    (a turn starts at each user message) to `max_chars` plus a marker, so the history
+    budget holds more conversation and less stale data. Returns a new list: no message is
+    removed, no tool_use_id changes, and the stored turns are never touched.
+    """
+    user_idx = [i for i, m in enumerate(messages) if m.get("role") == "user"]
+    if len(user_idx) <= keep_turns:
+        return list(messages)
+    cutoff = user_idx[-keep_turns]
+    out = []
+    for i, m in enumerate(messages):
+        if i < cutoff and m.get("role") == "tool_results":
+            content = []
+            for r in m.get("content", []):
+                text = r.get("content") or ""
+                if isinstance(text, str) and len(text) > max_chars:
+                    r = dict(r, content=text[:max_chars] + COMPACT_MARKER)
+                content.append(r)
+            m = dict(m, content=content)
+        out.append(m)
+    return out
+
+
+def _to_responses_input(messages: list[dict]) -> list[dict]:
+    """Provider-neutral turns → Responses API `input` items. Tool-call ids are kept as the
+    function_call / function_call_output call_id so stored history stays valid."""
+    out: list[dict] = []
+    for m in messages:
+        role = m.get("role")
+        if role == "user":
+            out.append({"role": "user", "content": m["content"]})
+        elif role == "assistant":
+            for b in m.get("content", []):
+                if b.get("type") == "text" and b.get("text"):
+                    out.append({"role": "assistant", "content": b["text"]})
+                elif b.get("type") == "tool_use":
+                    out.append({
+                        "type": "function_call", "call_id": b["id"], "name": b["name"],
+                        "arguments": json.dumps(b.get("input", {})),
+                    })
+        elif role == "tool_results":
+            for r in m.get("content", []):
+                content = r["content"]
+                out.append({"type": "function_call_output", "call_id": r["tool_use_id"],
+                            "output": content if isinstance(content, str) else json.dumps(content)})
+    return out
+
+
+# ── Web-search citations ──────────────────────────────────────────
+
+def _annotation_dict(a) -> dict | None:
+    """Normalize a url_citation annotation (object or dict) to a plain dict, else None."""
+    if a is None:
+        return None
+    if isinstance(a, dict):
+        d = a
+    elif hasattr(a, "model_dump"):
+        d = a.model_dump()
+    else:
+        d = dict(vars(a))
+    if d.get("type") != "url_citation" or not d.get("url"):
+        return None
+    return {"type": "url_citation", "url": d["url"], "title": d.get("title") or "",
+            "start_index": d.get("start_index"), "end_index": d.get("end_index")}
+
+
+def _citation_label(url: str, title: str) -> str:
+    host = (urlparse(url).netloc or "").lower()
+    host = host[4:] if host.startswith("www.") else host
+    return host or (title or "source")[:40]
+
+
+def render_citations(text: str, annotations: list[dict]) -> str:
+    """Turn url_citation annotations into markdown links in the answer text, so
+    telegram_format renders them as <a>. Each source appears once: inline right after the cited
+    span when the indices are usable, otherwise in a trailing "Sources:" line. URLs the model
+    already wrote into the text are left alone."""
+    if not text or not annotations:
+        return text
+    seen: set[str] = set()
+    unique: list[dict] = []
+    for a in annotations:
+        a = _annotation_dict(a)
+        if a and a["url"] not in seen:
+            seen.add(a["url"])
+            unique.append(a)
+    inline, footer = [], []
+    for a in unique:
+        if a["url"] in text:
+            continue
+        end = a.get("end_index")
+        if isinstance(end, int) and 0 < end <= len(text):
+            inline.append((end, a))
+        else:
+            footer.append(a)
+    for end, a in sorted(inline, key=lambda x: x[0], reverse=True):
+        while end < len(text) and not text[end].isspace():  # finish the word / sentence
+            end += 1
+        link = f" ([{_citation_label(a['url'], a['title'])}]({a['url']}))"
+        text = text[:end] + link + text[end:]
+    if footer:
+        text += "\n\nSources: " + " · ".join(
+            f"[{_citation_label(a['url'], a['title'])}]({a['url']})" for a in footer)
+    return text
+
+
 # ── Agent entry point ─────────────────────────────────────────────
 
 async def agent_chat(user_message: str, progress=None) -> dict:
     """
     Run the agent loop with streaming. Returns:
-      {"text": "...", "actions": [...]}
-    where actions is a list of write-actions needing user approval (may be empty).
+      {"text": "...", "actions": [...], "files": [...]}
+    where actions is a list of write-actions needing user approval (may be empty) and files
+    are generated attachments to send after the text ({kind, bytes, filename, caption}).
     """
     session_id = await get_current_session()
-    system = await build_system_prompt()
-    history = await db.get_turn_messages(session_id, config.HISTORY_TOKEN_BUDGET)
+    history, dropped = await db.get_turn_messages_with_dropped(session_id, config.HISTORY_TOKEN_BUDGET)
+    if dropped:
+        await _background(memory.summarize_turns(session_id, dropped))
+    history = compact_history(history)
+    system = await build_system_prompt(user_message)
 
     user_turn = [{"role": "user", "content": user_message}]
     messages = history + user_turn
@@ -391,6 +571,8 @@ async def agent_chat(user_message: str, progress=None) -> dict:
                            prompt_tokens=totals["prompt"], completion_tokens=totals["completion"],
                            cost_usd=totals["cost"])
     await _update_working_set(entities)
+    if config.MEMORY_AUTO_EXTRACT:
+        await _background(memory.extract_and_store(user_message, result.get("text", "")))
 
     return result
 
@@ -405,13 +587,15 @@ async def _run_one_tool(tu: dict, progress) -> dict:
         return {"result": f"Tool failed: {tu['name']}: {e}"}
 
 
-async def _run_tools(tool_uses: list[dict], progress) -> tuple[list[dict], list[dict], list[dict]]:
+async def _run_tools(tool_uses: list[dict], progress, files: list[dict] | None = None
+                     ) -> tuple[list[dict], list[dict], list[dict]]:
     """
     Execute one round's tool calls. Read-only tools run concurrently (at most
     config.MAX_PARALLEL_TOOLS at once); WRITE_TOOLS run afterwards, one at a time, in
     call order. Results are returned in the ORIGINAL call order so tool_use /
     tool_results pairing never changes. tool_uses: [{"id", "name", "input"}].
-    Returns (results [{"tool_use_id","content"}], pending_actions, entities).
+    Returns (results [{"tool_use_id","content"}], pending_actions, entities); any `files`
+    a tool produced (generated images) are appended to the optional `files` sink.
     """
     outcomes: list[dict | None] = [None] * len(tool_uses)
     read_idx = [i for i, tu in enumerate(tool_uses) if tu["name"] not in WRITE_TOOLS]
@@ -440,6 +624,8 @@ async def _run_tools(tool_uses: list[dict], progress) -> tuple[list[dict], list[
             actions.append(outcome["action"])
         if outcome.get("entities"):
             entities.extend(outcome["entities"])
+        if files is not None and outcome.get("files"):
+            files.extend(outcome["files"])
         results.append({"tool_use_id": tu["id"], "content": outcome.get("result", "")})
     return results, actions, entities
 
@@ -448,6 +634,143 @@ async def _run_tools(tool_uses: list[dict], progress) -> tuple[list[dict], list[
 
 async def _openai_agent_loop(system: str, messages: list[dict], progress
                              ) -> tuple[dict, list[dict], list[dict], dict]:
+    """Dispatch on config.OPENAI_API_MODE: "chat" → the chat.completions loop, anything else →
+    the Responses API loop. Both return (result, turn_norm, entities, totals)."""
+    if config.OPENAI_API_MODE == "chat":
+        return await _chat_agent_loop(system, messages, progress)
+    return await _responses_agent_loop(system, messages, progress)
+
+
+def _parse_tool_args(raw: str) -> dict:
+    try:
+        parsed = json.loads(raw) if raw else {}
+    except json.JSONDecodeError:
+        parsed = {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _responses_kwargs(system: str, input_items: list[dict], tools: list[dict],
+                      previous_response_id: str | None) -> dict:
+    kwargs = dict(
+        model=config.OPENAI_MODEL,
+        instructions=system,
+        input=input_items,
+        tools=tools,
+        max_output_tokens=config.LLM_MAX_TOKENS,
+        store=True,  # required for previous_response_id chaining
+        stream=True,
+    )
+    if config.OPENAI_REASONING_EFFORT:
+        kwargs["reasoning"] = {"effort": config.OPENAI_REASONING_EFFORT}
+    if previous_response_id:
+        kwargs["previous_response_id"] = previous_response_id
+    return kwargs
+
+
+async def _responses_agent_loop(system: str, messages: list[dict], progress
+                                ) -> tuple[dict, list[dict], list[dict], dict]:
+    """
+    Responses API loop. Round 1 sends the whole provider-neutral history as `input`; later
+    rounds send only the function_call_output items with previous_response_id, so the
+    model's reasoning state carries across tool rounds. Text deltas stream to progress.on_text;
+    function calls are read from the completed response; usage comes from its `usage`.
+    """
+    client = _client()
+    tools = get_responses_tools()
+    if config.WEB_SEARCH_ENABLED:
+        tools.append({"type": "web_search"})
+
+    turn_norm: list[dict] = []
+    pending_actions: list[dict] = []
+    all_entities: list[dict] = []
+    files: list[dict] = []
+    final_text = RAN_OUT_TEXT
+    totals = {"prompt": 0, "cached": 0, "completion": 0, "cost": 0.0}
+
+    input_items = _to_responses_input(messages)
+    previous_id: str | None = None
+
+    for _ in range(MAX_TOOL_ROUNDS):
+        streamed = ""
+        annotations: list[dict] = []
+        completed = None
+        kwargs = _responses_kwargs(system, input_items, tools, previous_id)
+        stream = await with_retry(lambda: client.responses.create(**kwargs), "agent")
+        async for event in stream:
+            et = getattr(event, "type", "")
+            if et == "response.output_text.delta":
+                streamed += event.delta or ""
+                await _notify(progress, "on_text", streamed)
+            elif et == "response.output_text.annotation.added":
+                a = _annotation_dict(getattr(event, "annotation", None))
+                if a:
+                    annotations.append(a)
+            elif et == "response.output_item.done":
+                item = getattr(event, "item", None)
+                if getattr(item, "type", "") == "web_search_call":
+                    action = getattr(item, "action", None)
+                    query = getattr(action, "query", None) if action is not None else None
+                    await _notify(progress, "on_tool", "web_search", {"query": query or ""})
+            elif et in ("response.completed", "response.incomplete"):
+                completed = event.response
+                if et == "response.incomplete":
+                    reason = getattr(getattr(completed, "incomplete_details", None), "reason", "?")
+                    logger.warning(f"Responses stream incomplete: {reason}")
+            elif et == "response.failed":
+                err = getattr(getattr(event, "response", None), "error", None)
+                raise RuntimeError(f"Responses API failure: {getattr(err, 'message', err) or 'unknown'}")
+            elif et == "error":
+                raise RuntimeError(f"Responses API error: {getattr(event, 'message', event)}")
+
+        tool_uses: list[dict] = []
+        if completed is not None:
+            previous_id = getattr(completed, "id", None) or previous_id
+            usage = getattr(completed, "usage", None)
+            if usage:
+                u = await record_usage("agent", config.OPENAI_MODEL, usage)
+                for k in ("prompt", "cached", "completion", "cost"):
+                    totals[k] += u[k]
+            for item in getattr(completed, "output", None) or []:
+                itype = getattr(item, "type", "")
+                if itype == "function_call":
+                    tool_uses.append({"id": item.call_id, "name": item.name,
+                                      "input": _parse_tool_args(getattr(item, "arguments", "") or "")})
+                elif itype == "message" and not streamed:
+                    for part in getattr(item, "content", None) or []:
+                        if getattr(part, "type", "") == "output_text":
+                            streamed += part.text or ""
+                            if not annotations:
+                                annotations.extend(
+                                    a for a in map(_annotation_dict, getattr(part, "annotations", None) or []) if a)
+
+        norm_content = (
+            [{"type": "text", "text": streamed}] if streamed else []
+        ) + [{"type": "tool_use", **tu} for tu in tool_uses]
+        if norm_content:
+            turn_norm.append({"role": "assistant", "content": norm_content})
+
+        if not tool_uses:
+            final_text = render_citations(streamed.strip(), annotations)
+            break
+
+        results, actions, entities = await _run_tools(tool_uses, progress, files=files)
+        pending_actions.extend(actions)
+        all_entities.extend(entities)
+        turn_norm.append({"role": "tool_results", "content": results})
+        input_items = [{"type": "function_call_output", "call_id": r["tool_use_id"], "output": r["content"]}
+                       for r in results]
+        if previous_id is None:  # no completed event: resend everything rather than chain
+            input_items = _to_responses_input(messages + turn_norm)
+    else:
+        turn_norm.append({"role": "assistant", "content": [{"type": "text", "text": final_text}]})
+
+    return ({"text": final_text, "actions": pending_actions, "files": files},
+            turn_norm, all_entities, totals)
+
+
+async def _chat_agent_loop(system: str, messages: list[dict], progress
+                           ) -> tuple[dict, list[dict], list[dict], dict]:
+    """The pre-Responses chat.completions loop (OPENAI_API_MODE=chat). No web search."""
     client = _client()
     wire_messages = [{"role": "system", "content": system}] + _to_openai_messages(messages)
     oai_tools = get_openai_tools()
@@ -455,6 +778,7 @@ async def _openai_agent_loop(system: str, messages: list[dict], progress
     turn_norm: list[dict] = []
     pending_actions: list[dict] = []
     all_entities: list[dict] = []
+    files: list[dict] = []
     final_text = RAN_OUT_TEXT
     totals = {"prompt": 0, "cached": 0, "completion": 0, "cost": 0.0}
 
@@ -519,7 +843,7 @@ async def _openai_agent_loop(system: str, messages: list[dict], progress
             ],
         })
 
-        results, actions, entities = await _run_tools(tool_uses, progress)
+        results, actions, entities = await _run_tools(tool_uses, progress, files=files)
         pending_actions.extend(actions)
         all_entities.extend(entities)
         turn_norm.append({"role": "tool_results", "content": results})
@@ -528,7 +852,8 @@ async def _openai_agent_loop(system: str, messages: list[dict], progress
     else:
         turn_norm.append({"role": "assistant", "content": [{"type": "text", "text": final_text}]})
 
-    return {"text": final_text, "actions": pending_actions}, turn_norm, all_entities, totals
+    return ({"text": final_text, "actions": pending_actions, "files": files},
+            turn_norm, all_entities, totals)
 
 
 # ── Draft revision (Approve / Edit / Reject loop) ────────────────
@@ -638,6 +963,122 @@ async def describe_image(data: bytes, mime: str) -> str:
     ), "vision")
     await record_usage("vision", config.OPENAI_MODEL, getattr(response, "usage", None))
     return (response.choices[0].message.content or "").strip()
+
+
+_IMAGE_SIZES = {"1024x1024", "1536x1024", "1024x1536"}
+_IMAGE_SIZE_ALIASES = {"square": "1024x1024", "landscape": "1536x1024", "wide": "1536x1024",
+                       "portrait": "1024x1536", "tall": "1024x1536"}
+
+
+def image_size(raw: str | None) -> str:
+    """Normalize a requested size ('landscape', '1536x1024', …) to one the image API accepts."""
+    key = (raw or "").strip().lower()
+    key = _IMAGE_SIZE_ALIASES.get(key, key)
+    return key if key in _IMAGE_SIZES else "1024x1024"
+
+
+async def generate_image(prompt: str, size: str | None = None) -> bytes:
+    """Generate one PNG with the image model (not outbound: the picture only goes back to the
+    owner). Usage is recorded per image under purpose "image"."""
+    size = image_size(size)
+    response = await with_retry(lambda: _client().images.generate(
+        model=config.IMAGE_MODEL, prompt=prompt, n=1, size=size, quality=config.IMAGE_QUALITY,
+    ), "image")
+    data = response.data[0]
+    if not getattr(data, "b64_json", None):
+        raise RuntimeError("image API returned no image data")
+    png = base64.b64decode(data.b64_json)
+    await record_usage("image", config.IMAGE_MODEL, {"images": 1})
+    return png
+
+
+# ── Spoken replies (TTS) ──────────────────────────────────────────
+
+VOICE_MODES = ("auto", "on", "off")
+VOICE_SETTING = "voice_reply_mode"
+
+_SAY_IT_RE = re.compile(
+    r"\b(say (it|that|this)|read (it|that|this) (out|aloud|to me)|out loud|speak (it|that|this)"
+    r"|(reply|answer|respond|tell me) (by|with|in|via) voice|voice (reply|note|message) please)\b",
+    re.IGNORECASE,
+)
+
+
+async def voice_mode() -> str:
+    mode = (await db.get_setting(VOICE_SETTING) or "auto").strip().lower()
+    return mode if mode in VOICE_MODES else "auto"
+
+
+def wants_spoken_reply(user_text: str) -> bool:
+    """Did the user ask for this particular answer out loud ("say it", "read it to me")?"""
+    return bool(_SAY_IT_RE.search(user_text or ""))
+
+
+def should_speak(mode: str, incoming_voice: bool, say_it: bool = False) -> bool:
+    """The voice-reply decision: an explicit 'say it' always speaks; /voice on always speaks;
+    /voice off never speaks otherwise; auto speaks only when the user sent a voice note."""
+    if say_it:
+        return True
+    if mode == "on":
+        return True
+    if mode == "off":
+        return False
+    return bool(incoming_voice)
+
+
+def strip_markdown(text: str) -> str:
+    """Plain text for TTS: no code fences, links become their label, emphasis/headers/bullets
+    dropped, bare URLs removed."""
+    t = text or ""
+    t = re.sub(r"```[a-zA-Z0-9_+-]*\n?(.*?)```", lambda m: m.group(1).strip("\n"), t, flags=re.DOTALL)
+    t = re.sub(r"`([^`\n]+)`", r"\1", t)
+    t = re.sub(r"\[([^\]]+)\]\((?:https?://[^)\s]+)\)", r"\1", t)
+    t = re.sub(r"<[^<>\n]{1,80}>", "", t)
+    t = re.sub(r"\*\*(.+?)\*\*", r"\1", t, flags=re.DOTALL)
+    t = re.sub(r"~~(.+?)~~", r"\1", t, flags=re.DOTALL)
+    t = re.sub(r"(?<![\w*])\*(?!\s)([^*\n]+?)(?<!\s)\*(?![\w*])", r"\1", t)
+    t = re.sub(r"(?<![\w_])_(?!\s)([^_\n]+?)(?<!\s)_(?![\w_])", r"\1", t)
+    t = re.sub(r"https?://\S+", "", t)
+    lines = []
+    for line in t.split("\n"):
+        line = re.sub(r"^\s*#{1,6}\s+", "", line)
+        line = re.sub(r"^\s*>\s?", "", line)
+        line = re.sub(r"^\s*[-*+•]\s+", "", line)
+        lines.append(line.rstrip())
+    t = "\n".join(lines)
+    t = re.sub(r"[ \t]{2,}", " ", t)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    return t.strip()
+
+
+def speech_text(text: str, max_chars: int | None = None) -> str:
+    """Markdown-stripped answer, cut at a sentence boundary to at most max_chars."""
+    limit = max_chars or config.VOICE_OUT_MAX_CHARS
+    plain = strip_markdown(text)
+    if len(plain) <= limit:
+        return plain
+    cut = plain[:limit]
+    boundary = max(cut.rfind(". "), cut.rfind("! "), cut.rfind("? "), cut.rfind("\n"))
+    if boundary >= limit // 2:
+        cut = cut[:boundary + 1]
+    else:
+        cut = cut.rsplit(" ", 1)[0]
+    return cut.strip()
+
+
+async def synthesize_speech(text: str) -> bytes:
+    """Speak an answer with the TTS model; returns Ogg/Opus bytes for a Telegram voice note.
+    Usage is recorded under "tts" with the character count in prompt_tokens (see config)."""
+    spoken = speech_text(text)
+    if not spoken:
+        return b""
+    response = await with_retry(lambda: _client().audio.speech.create(
+        model=config.VOICE_OUT_MODEL, voice=config.VOICE_OUT_VOICE, input=spoken,
+        response_format="opus",
+    ), "tts")
+    data = await response.aread() if hasattr(response, "aread") else response.content
+    await record_usage("tts", config.VOICE_OUT_MODEL, {"prompt_tokens": len(spoken)})
+    return data
 
 
 async def draft_followup(topic: str, to: str, days: int, channel: str = "email") -> str:

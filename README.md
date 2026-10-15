@@ -6,7 +6,11 @@ approval, watches Google Reviews, and briefs you every morning.
 
 ## Features
 
-- **AI Chat** — Natural-language assistant powered by OpenAI (streaming replies, tool use, long-term memory)
+- **AI Chat** — Natural-language assistant powered by OpenAI (streaming replies, tool use, long-term memory) on the Responses API, with reasoning carried across tool steps
+- **Web Browsing** — "What's the current mortgage rate?" / "find a licensed electrician near 12 Oak" uses OpenAI's built-in web search; answers cite their sources as links
+- **Image Generation** — "Draw a flyer concept for the open house" makes a picture with `gpt-image-1` and sends it as a photo
+- **Spoken Replies** — Voice notes get a voice answer back (text too); say "say it" or "read it to me" for any answer, or `/voice on` for every reply
+- **Memory that keeps up** — Durable facts (preferences, people, properties, standing instructions) are learned from every conversation automatically and deduplicated; each reply sees the memories most relevant to what you just said; earlier conversations are summarized so "the plumber from last time" still works days later
 - **Voice, Photos & PDFs** — Send a voice note, photo, or document; it's transcribed/read, answered, and indexed
 - **Gmail Integration** — Read, search, draft, reply in-thread, and send (cc/bcc/attachments) across multiple accounts
 - **Hybrid Search** — Keyword + semantic search over email, PDFs, files, and messages, with sender/date filters
@@ -61,12 +65,19 @@ Optional (defaults in parentheses):
 |---|---|
 | `OPENAI_MODEL` | Chat model (`gpt-5.1`) |
 | `OPENAI_FAST_MODEL` | Cheap model for triage and short drafts (`gpt-5-mini`) |
+| `OPENAI_API_MODE` | Agent loop API: `responses` (default; reasoning chained across tool rounds, built-in web search) or `chat` to fall back to chat.completions |
+| `OPENAI_REASONING_EFFORT` | Reasoning effort for the Responses loop: `none` / `low` / `medium` / `high` (`low`) |
+| `WEB_SEARCH_ENABLED` | Built-in web search in the Responses loop (1) |
+| `IMAGE_MODEL` / `IMAGE_QUALITY` | Image generation model and quality (`gpt-image-1` / `medium`) |
+| `VOICE_OUT_MODEL` / `VOICE_OUT_VOICE` / `VOICE_OUT_MAX_CHARS` | Spoken replies: TTS model, voice, longest answer read aloud (`gpt-4o-mini-tts` / `alloy` / 1500) |
 | `MAX_PARALLEL_TOOLS` | Read-only tools run concurrently per agent round, up to this many (4) |
 | `OPENAI_TIMEOUT_SECONDS` / `TURN_TIMEOUT_SECONDS` | HTTP timeout per OpenAI request / budget for one whole agent turn (60 / 180) |
 | `EMBEDDING_MODEL` / `EMBEDDING_DIM` | Semantic-search embeddings (`text-embedding-3-small` / 512) |
 | `VOICE_MODEL` | Voice transcription (`gpt-4o-mini-transcribe`, auto-falls back to `whisper-1`) |
 | `LLM_MAX_TOKENS` | Max tokens per reply (8192) |
-| `HISTORY_TOKEN_BUDGET` | Conversation context sent to the model, in tokens (30000) |
+| `HISTORY_TOKEN_BUDGET` | Conversation context sent to the model, in tokens (30000); tool results older than the two most recent turns are compacted to 400 chars first |
+| `MEMORY_AUTO_EXTRACT` | Learn durable facts from each conversation turn with the fast model (1; 0 keeps only the explicit `remember` tool) |
+| `MEMORY_TOP_K` | Memories picked by relevance to the current message for the prompt, on top of the 5 newest (12) |
 | `SESSION_IDLE_RESET_MINUTES` | Start a fresh conversation after this much idle time (120) |
 | `USER_NAME` | Your name, used in the assistant's prompt |
 | `DEFAULT_GMAIL_ACCOUNT` | Gmail account label activated at startup (`personal`) |
@@ -137,12 +148,14 @@ Everything works through natural language; commands are shortcuts and admin cont
 | Command | Description |
 |---|---|
 | `/new` | Start a fresh conversation (keeps long-term memories) |
-| `/memories` | List long-term memories the AI has saved |
+| `/voice [on\|off\|auto]` | Spoken replies: every answer / never / only when you sent a voice note (default `auto`; "say it" always works) |
+| `/memories` | Long-term memories — saved on request and learned automatically — plus recent conversation summaries |
+| `/summaries` | Summaries of earlier conversations (written on `/new`, idle reset, or when history is trimmed) |
 | `/reminders` | Pending reminders (set them in plain English: "remind me Friday at 9 to…") |
 | `/waiting` | Sent emails/texts with no reply, each with Nudge / Dismiss buttons |
 | `/alerts [on\|off]` | Urgent-alert status, watch-list, last alerts; toggle on/off |
 | `/digest [evening]` | Send the morning briefing or evening wrap-up now |
-| `/forget <id>` | Delete a memory |
+| `/forget <id>` | Delete a memory (saved or auto-learned) |
 | `/cancel` | Cancel an in-progress draft edit |
 
 **Email**
@@ -203,7 +216,8 @@ Everything works through natural language; commands are shortcuts and admin cont
 ```
 main.py             — Entry point
 bot.py              — Telegram handlers, streaming status UX, approval/Edit flow, digest
-llm.py              — Streaming OpenAI agent loop, sessions, system prompt, memory helpers
+llm.py              — Streaming OpenAI agent loop, sessions, system prompt, tool-result compaction
+memory.py           — Memory 2.0: auto-extraction + dedupe, relevance retrieval, session summaries
 agent_tools.py      — Tool schemas + execution (search, read, draft/reply, contacts, remember)
 search_index.py     — SQLite FTS5 index + hybrid (keyword+semantic) retrieval
 embeddings.py       — OpenAI embeddings stored in SQLite, numpy similarity search
@@ -223,7 +237,7 @@ waiting_on.py       — Waiting-on tracker: unanswered sent mail/texts, Nudge dr
 alerts.py           — Urgent inbound triage (watch-list + fast model), 🚨 cards with Reply/Seen, quiet hours
 digest.py           — Morning briefing / evening wrap-up sections, composed by the fast model
 ops.py              — /doctor health checks, nightly DB backup, /update and /restart
-db.py               — SQLite: turns, memories, contacts, pending actions, audit log
+db.py               — SQLite: turns, memories (+ embeddings, session summaries), contacts, pending actions, audit log
 config.py           — Environment variable loading
 deploy/             — macOS LaunchAgent template + MAC_SETUP.md (24/7 on a Mac mini)
 evals/              — Retrieval/agent eval set mined from real queries; `python -m evals.run`
@@ -238,7 +252,10 @@ Runtime data lives next to the code: `clawdbot.db` (index, conversations, memori
 Every OpenAI call is recorded with its token usage; `/usage` turns that into dollars using the
 price table `PRICES_PER_MTOK` in `config.py`. The values shipped there are placeholders — check
 [OpenAI's pricing page](https://platform.openai.com/docs/pricing) and update them, and add any
-model you switch to (unknown models are counted at $0 and flagged in `/usage`).
+model you switch to (unknown models are counted at $0 and flagged in `/usage`). Two entries are
+not per-token: `gpt-image-1` is priced per image (`per_image`; the usage row stores the image
+count in `completion_tokens`) and `gpt-4o-mini-tts` per character (its `in` figure is USD per
+1M characters; the usage row stores characters in `prompt_tokens`).
 
 ## Running 24/7 on a Mac
 

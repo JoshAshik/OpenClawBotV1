@@ -146,6 +146,7 @@ def test_agent_loop_captures_stream_usage(index_db, monkeypatch):
             return chunks()
 
     monkeypatch.setattr(llm, "_client", lambda: SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions())))
+    monkeypatch.setattr(config, "OPENAI_API_MODE", "chat")  # the Responses loop has its own tests
     result, turn, entities, totals = run_async(
         llm._openai_agent_loop("sys", [{"role": "user", "content": "hi"}], None))
     assert result["text"] == "Hello" and result["actions"] == []

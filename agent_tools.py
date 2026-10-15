@@ -9,6 +9,7 @@ Each tool has:
 The LLM sees the schemas and decides which tools to call.
 """
 
+import copy
 import json
 import logging
 
@@ -387,6 +388,30 @@ TOOL_SCHEMAS = [
                 "source_id": {"type": "string", "description": "The source ID from search results (e.g. 'personal:abc123')"},
             },
             "required": ["source", "source_id"],
+        },
+    },
+    {
+        "name": "generate_image",
+        "description": (
+            "Create a brand-new picture from a text description — an illustration, a flyer or "
+            "listing concept, a diagram, a mockup. The image is sent straight to the user as a "
+            "photo; you only add a short note. NOT for finding pictures that already exist online "
+            "(use web search and give the link instead)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "description": "What the picture should show, in detail (subject, style, mood, text to include)",
+                },
+                "size": {
+                    "type": "string",
+                    "enum": ["1024x1024", "1536x1024", "1024x1536"],
+                    "description": "Square (default), landscape, or portrait",
+                },
+            },
+            "required": ["prompt"],
         },
     },
     {
@@ -978,7 +1003,8 @@ async def execute_tool(name: str, args: dict) -> dict:
             return {"result": "Contact matches (most frequent first):\n" + "\n".join(lines)}
 
         elif name == "remember":
-            memory_id = await db.add_memory(args["fact"], args.get("category"))
+            import memory  # lazy: memory → llm → agent_tools
+            memory_id = await memory.store_memory(args["fact"], args.get("category"), source="explicit")
             return {"result": f"Saved to memory (#{memory_id}): {args['fact']}"}
 
         elif name == "set_reminder":
@@ -1066,6 +1092,22 @@ async def execute_tool(name: str, args: dict) -> dict:
                 logger.info(f"read_indexed_document: no content for {source}:{source_id}")
                 return {"result": f"No indexed content found for {source}:{source_id}. Try read_email or read_pdf_from_email instead."}
             return {"result": content[:4000]}
+
+        elif name == "generate_image":
+            import llm  # lazy: llm imports this module
+
+            prompt = (args.get("prompt") or "").strip()
+            if not prompt:
+                return {"result": "generate_image needs a prompt describing the picture."}
+            png = await llm.generate_image(prompt, args.get("size"))
+            caption = prompt if len(prompt) <= 200 else prompt[:197] + "…"
+            return {
+                "result": (
+                    f"Image generated ({llm.image_size(args.get('size'))}) and sent to the user as a "
+                    f"photo with the caption \"{caption}\". Reply with one short line; don't describe it."
+                ),
+                "files": [{"kind": "photo", "bytes": png, "filename": "image.png", "caption": caption}],
+            }
 
         elif name == "get_index_stats":
             stats = await search_index.get_index_stats()
@@ -1176,8 +1218,44 @@ def _format_pdf_results(results: list[dict]) -> str:
 
 # ── Convert to OpenAI format ─────────────────────────────────────
 
+def _strict_schema(schema: dict) -> dict | None:
+    """A copy of `schema` usable with strict function calling, or None when the schema has
+    optional properties (strict mode requires every property to be required)."""
+    schema = copy.deepcopy(schema)
+
+    def _walk(node) -> bool:
+        if not isinstance(node, dict):
+            return True
+        if node.get("type") == "object":
+            props = node.get("properties") or {}
+            if set(node.get("required") or []) != set(props):
+                return False
+            node["additionalProperties"] = False
+            return all(_walk(v) for v in props.values())
+        if node.get("type") == "array":
+            return _walk(node.get("items"))
+        return True
+
+    return schema if _walk(schema) else None
+
+
+def get_responses_tools() -> list[dict]:
+    """Our tool schemas in Responses API function-tool format; strict where the schema allows."""
+    out = []
+    for t in TOOL_SCHEMAS:
+        strict = _strict_schema(t["input_schema"])
+        out.append({
+            "type": "function",
+            "name": t["name"],
+            "description": t["description"],
+            "parameters": strict if strict is not None else t["input_schema"],
+            "strict": strict is not None,
+        })
+    return out
+
+
 def get_openai_tools() -> list[dict]:
-    """Convert our tool schemas to OpenAI function calling format."""
+    """Convert our tool schemas to OpenAI chat.completions function calling format."""
     return [
         {
             "type": "function",
