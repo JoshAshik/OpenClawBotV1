@@ -11,10 +11,16 @@ Outbound actions (send email, send message) go through the approval flow:
   3. Everything is audit-logged
 """
 
+import asyncio
 import json
 import logging
+import time
+import uuid
+from datetime import datetime, time as dtime, timezone
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ChatAction
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -24,6 +30,7 @@ from telegram.ext import (
     filters,
 )
 
+import agent_tools
 import config
 import db
 import gmail_module
@@ -33,8 +40,240 @@ import reviews
 import search_index
 import security
 from security import ActionCategory, auth_required
+from telegram_format import markdown_to_telegram_html
 
 logger = logging.getLogger(__name__)
+
+TELEGRAM_MAX_LEN = 4096
+
+# Friendly labels for the live status message while tools run.
+_TOOL_LABELS = {
+    "search_everything": "🔍 Searching everything",
+    "search_emails": "📧 Searching email",
+    "list_recent_emails": "📥 Checking the inbox",
+    "read_email": "📖 Reading an email",
+    "read_pdf_from_email": "📄 Reading a PDF attachment",
+    "search_pdfs": "📄 Searching PDFs",
+    "draft_email": "✍️ Drafting an email",
+    "reply_email": "✍️ Drafting a reply",
+    "check_reviews": "⭐ Checking reviews",
+    "list_properties": "🏠 Listing properties",
+    "search_onedrive": "📁 Searching OneDrive",
+    "read_onedrive_file": "📁 Reading a OneDrive file",
+    "read_indexed_document": "📖 Reading a document",
+    "get_index_stats": "📊 Checking the index",
+    "remember": "💾 Saving to memory",
+}
+
+
+def _tool_label(name: str, args: dict) -> str:
+    label = _TOOL_LABELS.get(name, f"⚙️ {name}")
+    query = args.get("query") if isinstance(args, dict) else None
+    if query:
+        label += f': "{str(query)[:60]}"'
+    return label
+
+
+class StatusMessage:
+    """
+    One Telegram message that lives through an agent turn:
+    starts as "Thinking…", shows each tool step, streams the answer text,
+    and finally becomes the formatted answer (ChatGPT-app feel).
+    """
+
+    MIN_EDIT_INTERVAL = 1.5  # Telegram edit rate limit safety
+
+    def __init__(self, bot, chat_id: int):
+        self._bot = bot
+        self._chat_id = chat_id
+        self._message = None
+        self._steps: list[str] = []
+        self._stream_text = ""
+        self._last_edit = 0.0
+        self._last_rendered = ""
+
+    async def start(self) -> None:
+        try:
+            await self._bot.send_chat_action(chat_id=self._chat_id, action=ChatAction.TYPING)
+        except Exception:
+            pass
+        self._message = await self._bot.send_message(chat_id=self._chat_id, text="🤔 Thinking…")
+
+    # -- callbacks invoked by llm.py --
+
+    async def on_tool(self, name: str, args: dict) -> None:
+        if self._steps:
+            self._steps[-1] = self._steps[-1].replace("⏳ ", "✅ ", 1)
+        self._steps.append("⏳ " + _tool_label(name, args))
+        self._stream_text = ""  # narration before a tool call is superseded
+        await self._render(force=True)
+
+    async def on_text(self, text: str) -> None:
+        self._stream_text = text
+        await self._render()
+
+    # -- rendering --
+
+    def _compose_progress(self) -> str:
+        parts = list(self._steps)
+        snippet = self._stream_text.strip()
+        if snippet:
+            if len(snippet) > 3000:
+                snippet = snippet[-3000:]
+            parts.append(snippet + " ▌")
+        elif not parts:
+            parts.append("🤔 Thinking…")
+        return "\n".join(parts)[:TELEGRAM_MAX_LEN - 10]
+
+    async def _render(self, force: bool = False) -> None:
+        if self._message is None:
+            return
+        now = time.monotonic()
+        if not force and now - self._last_edit < self.MIN_EDIT_INTERVAL:
+            return
+        text = self._compose_progress()
+        if text == self._last_rendered:
+            return
+        self._last_edit = now
+        self._last_rendered = text
+        try:
+            await self._message.edit_text(text)
+        except BadRequest:
+            pass  # "message is not modified" and similar — harmless
+        except Exception:
+            logger.debug("status edit failed", exc_info=True)
+
+    async def _edit_final(self, chunk: str) -> None:
+        """Edit the status message into the final answer, HTML first, plain fallback."""
+        try:
+            await self._message.edit_text(
+                markdown_to_telegram_html(chunk), parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+        except BadRequest:
+            try:
+                await self._message.edit_text(chunk)
+            except BadRequest:
+                pass
+
+    async def finish(self, final_text: str) -> None:
+        if self._message is None:
+            return
+        final_text = final_text.strip() or "(no reply)"
+        chunks = [final_text[i:i + 4000] for i in range(0, len(final_text), 4000)]
+        await self._edit_final(chunks[0])
+        for chunk in chunks[1:]:
+            try:
+                await self._bot.send_message(
+                    chat_id=self._chat_id, text=markdown_to_telegram_html(chunk),
+                    parse_mode="HTML", disable_web_page_preview=True,
+                )
+            except BadRequest:
+                await self._bot.send_message(chat_id=self._chat_id, text=chunk)
+
+    async def fail(self, error: Exception, retry_key: str) -> None:
+        if self._message is None:
+            return
+        buttons = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🔄 Retry", callback_data=f"retry:{retry_key}")]]
+        )
+        msg = f"Something went wrong ({type(error).__name__}). Nothing was sent."
+        try:
+            await self._message.edit_text(msg, reply_markup=buttons)
+        except Exception:
+            logger.debug("error render failed", exc_info=True)
+
+
+# Last user prompts, keyed for the Retry button.
+_RETRY_CACHE: dict[str, str] = {}
+
+# Active "Edit draft" sessions: user_id -> {action_id, chat_id, message_id}.
+# While set, the user's next free-text message is edit instructions, not chat.
+_EDIT_STATE: dict[int, dict] = {}
+
+
+def _action_summary(action_type: str, payload: dict) -> str:
+    if action_type == "reply_email":
+        return f"Reply to {payload.get('to', '?')}"
+    if action_type == "send_email":
+        return f"Email to {payload.get('to', '?')}"
+    return action_type
+
+
+async def _handle_draft_edit(context: ContextTypes.DEFAULT_TYPE, user_id: int, instructions: str) -> None:
+    """Apply freeform edit instructions to the pending draft and refresh its card."""
+    state = _EDIT_STATE.get(user_id)
+    if state is None:
+        return
+    chat_id = state["chat_id"]
+
+    action = await db.get_pending_action(state["action_id"])
+    if action is None:
+        _EDIT_STATE.pop(user_id, None)
+        await context.bot.send_message(chat_id, "That draft was already resolved — nothing to edit.")
+        return
+
+    note = await context.bot.send_message(chat_id, "✏️ Revising the draft…")
+    try:
+        new_payload = await llm.revise_draft(action["action_type"], action["payload"], instructions)
+        await db.update_pending_action_payload(action["id"], new_payload)
+    except Exception as e:
+        logger.exception("Draft revision failed")
+        await note.edit_text(f"Couldn't revise the draft ({type(e).__name__}). Try again, or /cancel.")
+        return
+
+    card = _card_text(_action_summary(action["action_type"], new_payload),
+                      action["action_type"], new_payload, revised=True)
+    try:
+        await context.bot.edit_message_text(
+            chat_id=chat_id, message_id=state["message_id"], text=card,
+            parse_mode="Markdown", reply_markup=_approval_buttons(action["id"]),
+        )
+    except BadRequest:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id, message_id=state["message_id"], text=card,
+                reply_markup=_approval_buttons(action["id"]),
+            )
+        except BadRequest:
+            pass
+
+    _EDIT_STATE.pop(user_id, None)
+    try:
+        await note.edit_text("Updated the draft ⤴ — Approve, Edit again, or Reject.")
+    except BadRequest:
+        pass
+
+
+async def _run_agent_turn(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int, user_text: str) -> None:
+    """Shared free-text pipeline: status message → agent → final render → approvals."""
+    await db.log_audit("chat", "read", f"User message ({len(user_text)} chars)",
+                       user_id=user_id, approved=True)
+
+    status = StatusMessage(context.bot, chat_id)
+    await status.start()
+
+    try:
+        result = await llm.agent_chat(user_text, progress=status)
+    except Exception as e:
+        logger.exception("LLM agent call failed")
+        key = uuid.uuid4().hex[:12]
+        _RETRY_CACHE[key] = user_text
+        while len(_RETRY_CACHE) > 20:
+            _RETRY_CACHE.pop(next(iter(_RETRY_CACHE)))
+        await status.fail(e, key)
+        return
+
+    await status.finish(result["text"])
+
+    for action in result.get("actions", []):
+        await request_approval(
+            context, chat_id, user_id,
+            action_type=action["type"],
+            category=ActionCategory.WRITE,
+            summary=action["summary"],
+            payload=action["payload"],
+        )
 
 
 # ── Command Handlers ──────────────────────────────────────────────
@@ -56,7 +295,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await db.log_audit("session_start", "security", "Bot started", user_id=user.id, approved=True)
     await update.message.reply_text(
         "Clawdbot online.\n\n"
-        f"LLM: {llm.get_active_llm()}\n"
+        f"Model: {config.OPENAI_MODEL}\n"
         f"Session: {'unlocked' if security.is_session_unlocked() else 'locked'}\n\n"
         "Type /help for commands, or just send me a message."
     )
@@ -66,15 +305,22 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "*Clawdbot — Just talk to me!*\n\n"
-        "Type naturally and I'll figure out what to do:\n"
+        "Type naturally — or send a *voice note*, *photo*, or *PDF*:\n"
         "  \"Show me my latest emails\"\n"
         "  \"Find the lease for 123 Oak St\"\n"
         "  \"Any new reviews on my properties?\"\n"
-        "  \"Draft an email to john@... about the maintenance\"\n\n"
+        "  \"Reply to John's email saying I'll be there Monday\"\n\n"
         "I'll search emails, read PDFs, check reviews, and more — "
-        "automatically. Sending anything always requires your approval.\n\n"
+        "automatically. Sending anything always requires your approval, "
+        "and every draft card has an ✏️ Edit button for revisions.\n\n"
+        "*Conversation*\n"
+        "/new — Start a fresh conversation\n"
+        "/memories — Show long-term memories\n"
+        "/forget `<id>` — Delete a memory\n"
+        "/cancel — Cancel an in-progress draft edit\n\n"
+        "*Email*\n"
+        "/signature `<account> <text>` — Set a per-account signature\n\n"
         "*Shortcut commands* (optional)\n"
-        "/switch `<claude|chatgpt>` — Switch LLM\n"
         "/accounts — List connected Gmail accounts\n"
         "/addaccount `<label>` — Connect a Gmail account\n"
         "/useaccount `<label>` — Switch active account\n"
@@ -125,26 +371,12 @@ async def cmd_lock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 @auth_required
-async def cmd_switch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.args:
-        await update.message.reply_text(
-            f"Current LLM: *{llm.get_active_llm()}*\n\nUsage: /switch `claude` or /switch `chatgpt`",
-            parse_mode="Markdown",
-        )
-        return
-
-    result = llm.switch_llm(context.args[0])
-    await db.log_audit("llm_switch", "config", result, user_id=update.effective_user.id, approved=True)
-    await update.message.reply_text(result)
-
-
-@auth_required
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     rate_ok = security.check_rate_limit()
     used = len(security._outbound_timestamps)
     await update.message.reply_text(
         f"*Clawdbot Status*\n\n"
-        f"LLM: `{llm.get_active_llm()}`\n"
+        f"Model: `{config.OPENAI_MODEL}`\n"
         f"Session: {'unlocked' if security.is_session_unlocked() else 'LOCKED'}\n"
         f"Outbound this hour: {used}/{config.RATE_LIMIT_PER_HOUR}\n"
         f"Rate limit: {'OK' if rate_ok else 'EXCEEDED'}",
@@ -425,18 +657,11 @@ async def cmd_send(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     to, subject, body = parts
 
-    detail = (
-        f"*To:* {to}\n"
-        f"*Subject:* {subject}\n\n"
-        f"{body}"
-    )
-
     await request_approval(
-        update, context,
+        context, update.effective_chat.id, update.effective_user.id,
         action_type="send_email",
         category=ActionCategory.WRITE,
         summary=f"Email to {to}",
-        detail=detail,
         payload={"to": to, "subject": subject, "body": body},
     )
 
@@ -510,18 +735,11 @@ async def cmd_aidraft(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     to, subject, body = _parse_ai_draft(response)
 
-    detail = (
-        f"*To:* {to}\n"
-        f"*Subject:* {subject}\n\n"
-        f"{body}"
-    )
-
     await request_approval(
-        update, context,
+        context, update.effective_chat.id, update.effective_user.id,
         action_type="send_email",
         category=ActionCategory.WRITE,
         summary=f"AI-drafted email to {to}",
-        detail=detail,
         payload={"to": to, "subject": subject, "body": body},
     )
 
@@ -1042,6 +1260,18 @@ async def _background_index(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.error(f"Background index failed: {e}")
 
 
+async def _background_backfill(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Deep-index mailbox history + embed anything missing (daily, resumable)."""
+    try:
+        indexed = await indexer.backfill_all_gmail_accounts()
+        import embeddings
+        embedded = await embeddings.embed_missing(limit=3000)
+        if indexed or embedded:
+            logger.info(f"Backfill: {indexed} emails indexed, {embedded} items embedded")
+    except Exception as e:
+        logger.error(f"Backfill failed: {e}")
+
+
 # ── Review Commands ───────────────────────────────────────────────
 
 @auth_required
@@ -1271,47 +1501,58 @@ async def _background_review_poll(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ── Approval Flow ─────────────────────────────────────────────────
 
+def _approval_buttons(action_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Approve", callback_data=f"approve:{action_id}"),
+        InlineKeyboardButton("✏️ Edit", callback_data=f"edit:{action_id}"),
+        InlineKeyboardButton("❌ Reject", callback_data=f"reject:{action_id}"),
+    ]])
+
+
+def _card_text(summary: str, action_type: str, payload: dict, revised: bool = False) -> str:
+    detail = agent_tools.action_detail(action_type, payload)
+    tag = "Draft (revised)" if revised else "Draft"
+    return (f"*{tag} — {summary}*\n\n{detail}\n\n"
+            "_Approve to send · Edit to revise · Reject to discard._")
+
+
 async def request_approval(
-    update: Update,
     context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    user_id: int,
     action_type: str,
     category: ActionCategory,
     summary: str,
-    detail: str,
     payload: dict,
 ) -> None:
-    """Present an outbound action for user approval with inline buttons."""
+    """Present an outbound action for approval with Approve / Edit / Reject."""
     action_id = await db.create_pending_action(action_type, payload)
 
     await db.log_audit(
         action_type=f"{action_type}_pending",
         category=category.value,
         summary=summary,
-        detail=detail,
-        user_id=update.effective_user.id,
+        detail=agent_tools.action_detail(action_type, payload),
+        user_id=user_id,
     )
 
-    buttons = [
-        [
-            InlineKeyboardButton("Approve", callback_data=f"approve:{action_id}"),
-            InlineKeyboardButton("Reject", callback_data=f"reject:{action_id}"),
-        ]
-    ]
-
-    if category == ActionCategory.DANGEROUS:
-        preview = f"**DANGEROUS ACTION**\n\n*{summary}*\n\n{detail}\n\n_This requires confirmation._"
-    else:
-        preview = f"*Draft — {summary}*\n\n{detail}\n\n_Approve to send, Reject to discard._"
-
-    await update.message.reply_text(
-        preview,
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(buttons),
-    )
+    preview = _card_text(summary, action_type, payload)
+    try:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=preview,
+            parse_mode="Markdown",
+            reply_markup=_approval_buttons(action_id),
+        )
+    except BadRequest:
+        # Draft content broke Markdown parsing — send plain.
+        await context.bot.send_message(
+            chat_id=chat_id, text=preview, reply_markup=_approval_buttons(action_id)
+        )
 
 
 async def handle_approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Process Approve/Reject button presses."""
+    """Process Approve/Reject/Retry button presses."""
     query = update.callback_query
     await query.answer()
 
@@ -1325,9 +1566,38 @@ async def handle_approval_callback(update: Update, context: ContextTypes.DEFAULT
         return
 
     decision, action_id_str = data.split(":", 1)
+
+    if decision == "retry":
+        user_text = _RETRY_CACHE.pop(action_id_str, None)
+        if not user_text:
+            await query.edit_message_text("Nothing to retry (too old).")
+            return
+        try:
+            await query.edit_message_text("Retrying…")
+        except BadRequest:
+            pass
+        await _run_agent_turn(context, query.message.chat_id, user.id, user_text)
+        return
+
     try:
         action_id = int(action_id_str)
     except ValueError:
+        return
+
+    if decision == "edit":
+        action = await db.get_pending_action(action_id)
+        if action is None:
+            await query.edit_message_text("This draft was already resolved.")
+            return
+        _EDIT_STATE[user.id] = {
+            "action_id": action_id,
+            "chat_id": query.message.chat_id,
+            "message_id": query.message.message_id,
+        }
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text="✏️ Tell me what to change (e.g. \"shorter, and mention the deadline\"). /cancel to leave it as is.",
+        )
         return
 
     if decision == "approve":
@@ -1371,28 +1641,75 @@ async def handle_approval_callback(update: Update, context: ContextTypes.DEFAULT
         await query.edit_message_text("Rejected. Nothing was sent.")
 
 
+def _resolve_one_attachment(spec: dict, default_account: str | None) -> dict:
+    """Fetch attachment bytes from an email or OneDrive (runs in a thread)."""
+    if spec.get("source") == "onedrive":
+        from onedrive_module import download_file
+        data = download_file(spec["id"])
+    else:
+        raw_id = spec["id"]
+        att_account = default_account
+        if ":" in raw_id:
+            prefix, rest = raw_id.split(":", 1)
+            if prefix in {a["label"] for a in gmail_module.get_connected_accounts()}:
+                att_account, raw_id = prefix, rest
+        data = gmail_module.get_attachment_bytes(raw_id, spec["filename"], account=att_account)
+
+    if len(data) > 20 * 1024 * 1024:
+        raise RuntimeError(f"'{spec['filename']}' is too large to email ({len(data) // (1024 * 1024)}MB)")
+    return {"filename": spec["filename"], "data": data}
+
+
+async def _resolve_attachments(specs: list[dict] | None, account: str | None) -> list[dict]:
+    return [
+        await asyncio.to_thread(_resolve_one_attachment, spec, account)
+        for spec in (specs or [])
+    ]
+
+
 async def execute_approved_action(action: dict) -> str:
-    """
-    Dispatch approved actions to their handlers.
-    New action types (send_email, send_imessage, etc.) get added here in later phases.
-    """
+    """Dispatch approved actions to their handlers."""
     action_type = action["action_type"]
     payload = action["payload"]
 
     if action_type == "send_email":
         try:
-            result = gmail_module.send_email(
+            attachments = await _resolve_attachments(payload.get("attachments"), payload.get("account"))
+            result = await asyncio.to_thread(
+                gmail_module.send_email,
                 to=payload["to"],
                 subject=payload["subject"],
                 body=payload["body"],
+                account=payload.get("account"),
+                cc=payload.get("cc", ""),
+                bcc=payload.get("bcc", ""),
+                html=bool(payload.get("html")),
+                attachments=attachments,
             )
-            return f"Email sent to {payload['to']}.\nMessage ID: {result['message_id']}"
+            att_note = f" with {len(attachments)} attachment(s)" if attachments else ""
+            return f"Email sent to {payload['to']}{att_note}.\nMessage ID: {result['message_id']}"
         except Exception as e:
             return f"Send failed: {e}"
+    elif action_type == "reply_email":
+        try:
+            attachments = await _resolve_attachments(payload.get("attachments"), payload.get("account"))
+            result = await asyncio.to_thread(
+                gmail_module.reply_to_email,
+                payload["email_id"],
+                payload["body"],
+                account=payload.get("account"),
+                cc=payload.get("cc", ""),
+                bcc=payload.get("bcc", ""),
+                attachments=attachments,
+            )
+            att_note = f" with {len(attachments)} attachment(s)" if attachments else ""
+            return f"Reply sent to {result['to']} (in-thread){att_note}.\nMessage ID: {result['message_id']}"
+        except Exception as e:
+            return f"Reply failed: {e}"
     elif action_type == "send_imessage":
-        return "iMessage sending not yet implemented (Phase 5)."
+        return "iMessage sending not yet implemented (Phase 6 of the plan)."
     elif action_type == "send_whatsapp":
-        return "WhatsApp sending not yet implemented (Phase 6)."
+        return "WhatsApp sending not yet implemented (Phase 6 of the plan)."
     else:
         return f"Unknown action type: {action_type}"
 
@@ -1405,40 +1722,282 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user_text = update.message.text
     if not user_text:
         return
+    if update.effective_user.id in _EDIT_STATE:
+        await _handle_draft_edit(context, update.effective_user.id, user_text)
+        return
+    await _run_agent_turn(
+        context, update.effective_chat.id, update.effective_user.id, user_text
+    )
 
-    await db.log_audit("chat", "read", f"User message ({len(user_text)} chars)",
-                       user_id=update.effective_user.id, approved=True)
 
-    history = await db.get_recent_conversations(limit=20)
+@auth_required
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if _EDIT_STATE.pop(update.effective_user.id, None):
+        await update.message.reply_text("Edit cancelled — the draft is unchanged.")
+    else:
+        await update.message.reply_text("Nothing to cancel.")
 
-    try:
-        result = await llm.agent_chat(user_text, history)
-    except Exception as e:
-        logger.exception("LLM agent call failed")
-        await update.message.reply_text(f"LLM error: {type(e).__name__}: {e}")
+
+@auth_required
+async def cmd_signature(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Set per-account email signatures: /signature <account> <text> | clear | (no args to view)."""
+    text = update.message.text or ""
+    parts = text.split(None, 1)
+    rest = parts[1] if len(parts) > 1 else ""
+
+    if not rest.strip():
+        accounts = await llm._get_accounts_cached()
+        lines = ["*Signatures* — set with /signature `<account> <text>`, clear with /signature `<account> clear`\n"]
+        for a in accounts:
+            sig = await db.get_setting(f"signature:{a['label']}")
+            lines.append(f"*{a['label']}:*\n{sig}" if sig else f"*{a['label']}:* (none)")
+        await update.message.reply_text("\n\n".join(lines), parse_mode="Markdown")
         return
 
-    # Send the text response
-    response = result["text"]
-    if response:
-        max_len = 4000
-        if len(response) > max_len:
-            for i in range(0, len(response), max_len):
-                await update.message.reply_text(response[i : i + max_len])
-        else:
-            await update.message.reply_text(response)
+    sub = rest.split(None, 1)
+    label = sub[0].strip()
+    body = sub[1].strip() if len(sub) > 1 else ""
+    if not body:
+        await update.message.reply_text("Usage: /signature <account> <signature text> — or /signature <account> clear")
+        return
+    if body.lower() == "clear":
+        await db.set_setting(f"signature:{label}", "")
+        await update.message.reply_text(f"Signature for '{label}' cleared.")
+        return
+    await db.set_setting(f"signature:{label}", body)
+    await update.message.reply_text(f"Signature for '{label}' saved:\n\n{body}\n\nIt'll be applied to drafts from that account.")
 
-    # Route any write actions through the approval flow
-    for action in result.get("actions", []):
-        await request_approval(
-            update,
-            context,
-            action_type=action["type"],
-            category=ActionCategory.WRITE,
-            summary=action["summary"],
-            detail=action["detail"],
-            payload=action["payload"],
+
+# ── Conversation & Memory Commands ────────────────────────────────
+
+@auth_required
+async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Start a fresh conversation (clears short-term context, keeps memories)."""
+    await llm.start_new_session()
+    await update.message.reply_text("✨ Fresh conversation started. Long-term memories are kept.")
+
+
+@auth_required
+async def cmd_memories(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    memories = await db.list_memories(limit=30)
+    if not memories:
+        await update.message.reply_text(
+            "No memories saved yet. Tell me things like \"remember to sign my emails as Josh\"."
         )
+        return
+    lines = ["*Long-term memory*\n"]
+    for m in memories:
+        cat = f" ({m['category']})" if m["category"] else ""
+        lines.append(f"`#{m['id']}`{cat} {m['content']}")
+    lines.append("\nForget one with /forget `<id>`")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+@auth_required
+async def cmd_forget(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text("Usage: /forget <memory id> — see ids with /memories")
+        return
+    try:
+        memory_id = int(context.args[0].lstrip("#"))
+    except ValueError:
+        await update.message.reply_text("Memory id must be a number — see /memories")
+        return
+    if await db.delete_memory(memory_id):
+        await update.message.reply_text(f"Forgotten memory #{memory_id}.")
+    else:
+        await update.message.reply_text(f"No memory #{memory_id} found.")
+
+
+# ── Voice, Photos & Documents (Phase 5) ──────────────────────────
+
+_MEDIA_MAX_BYTES = 20 * 1024 * 1024
+
+
+@auth_required
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Telegram voice note / audio → transcription → normal agent flow."""
+    voice = update.message.voice or update.message.audio
+    if voice is None:
+        return
+    if (voice.file_size or 0) > _MEDIA_MAX_BYTES:
+        await update.message.reply_text("That audio is too large (20MB max).")
+        return
+
+    note = await update.message.reply_text("🎤 Transcribing…")
+    try:
+        tg_file = await context.bot.get_file(voice.file_id)
+        data = bytes(await tg_file.download_as_bytearray())
+        filename = getattr(voice, "file_name", None) or "voice.ogg"
+        transcript = await llm.transcribe_voice(data, filename)
+    except Exception as e:
+        logger.exception("Voice transcription failed")
+        await note.edit_text(f"Couldn't transcribe that ({type(e).__name__}).")
+        return
+
+    if not transcript:
+        await note.edit_text("I couldn't hear anything in that recording.")
+        return
+
+    try:
+        await note.edit_text(f"🎤 “{transcript}”")
+    except BadRequest:
+        pass
+
+    if update.effective_user.id in _EDIT_STATE:
+        await _handle_draft_edit(context, update.effective_user.id, transcript)
+        return
+    await _run_agent_turn(context, update.effective_chat.id, update.effective_user.id, transcript)
+
+
+def _extract_pdf_bytes(data: bytes) -> str:
+    import io
+    from PyPDF2 import PdfReader
+
+    reader = PdfReader(io.BytesIO(data))
+    pages = []
+    for page in reader.pages:
+        text = page.extract_text()
+        if text and text.strip():
+            pages.append(text.strip())
+    return "\n\n".join(pages)
+
+
+@auth_required
+async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Photos and documents (PDF/text) → extract → answer + index for later search."""
+    msg = update.message
+    caption = (msg.caption or "").strip()
+
+    if msg.photo:
+        file_id = msg.photo[-1].file_id
+        unique_id = msg.photo[-1].file_unique_id
+        filename, mime = "photo.jpg", "image/jpeg"
+    elif msg.document:
+        doc = msg.document
+        if (doc.file_size or 0) > _MEDIA_MAX_BYTES:
+            await msg.reply_text("That file is too large (20MB max).")
+            return
+        file_id, unique_id = doc.file_id, doc.file_unique_id
+        filename = doc.file_name or "file"
+        mime = doc.mime_type or ""
+    else:
+        return
+
+    note = await msg.reply_text("🖼 Looking…" if mime.startswith("image/") else "📄 Reading…")
+    try:
+        tg_file = await context.bot.get_file(file_id)
+        data = bytes(await tg_file.download_as_bytearray())
+
+        if mime.startswith("image/"):
+            extracted = await llm.describe_image(data, mime)
+            label = f"photo '{filename}'"
+        elif mime == "application/pdf" or filename.lower().endswith(".pdf"):
+            extracted = await asyncio.to_thread(_extract_pdf_bytes, data)
+            label = f"PDF '{filename}'"
+        elif mime.startswith("text/") or filename.lower().endswith((".txt", ".csv", ".md", ".log")):
+            extracted = data.decode("utf-8", errors="replace")
+            label = f"file '{filename}'"
+        else:
+            await note.edit_text(
+                f"I can read photos, PDFs, and text files — '{filename}' "
+                f"({mime or 'unknown type'}) isn't supported yet."
+            )
+            return
+    except Exception as e:
+        logger.exception("Media extraction failed")
+        await note.edit_text(f"Couldn't read that ({type(e).__name__}).")
+        return
+
+    extracted = (extracted or "").strip()
+    if not extracted:
+        await note.edit_text("I couldn't extract anything readable from that.")
+        return
+
+    # Index the upload so it's findable later via search_everything.
+    try:
+        import embeddings
+        await search_index.index_item(
+            "telegram", unique_id, filename, extracted,
+            {"date": datetime.now(timezone.utc).isoformat(), "from": "telegram upload"},
+        )
+        await embeddings.embed_item("telegram", unique_id, filename, extracted)
+    except Exception:
+        logger.debug("Telegram media indexing failed", exc_info=True)
+
+    try:
+        await note.delete()
+    except Exception:
+        pass
+
+    question = caption or "Summarize what you received and note anything that needs action."
+    agent_message = (
+        f"[The user sent a {label} via Telegram. Extracted content follows.]\n"
+        f"{extracted[:8000]}\n\n[User's message about it:] {question}"
+    )
+    await _run_agent_turn(context, update.effective_chat.id, update.effective_user.id, agent_message)
+
+
+# ── Morning Digest (Phase 5) ─────────────────────────────────────
+
+async def _daily_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Push a short triaged briefing: unread that matters, reviews, pending drafts."""
+    sections = []
+
+    for a in await llm._get_accounts_cached():
+        try:
+            unread = await asyncio.to_thread(
+                gmail_module.list_emails, max_results=15,
+                query="is:unread newer_than:1d", account=a["label"],
+            )
+            if unread:
+                lines = [f"- {e['from'][:45]}: {e['subject'][:70]}" for e in unread]
+                sections.append(f"UNREAD ({a['label']}, last 24h):\n" + "\n".join(lines))
+        except Exception:
+            sections.append(
+                f"UNREAD ({a['label']}): unavailable — Gmail needs reconnecting (/addaccount {a['label']})"
+            )
+
+    try:
+        cutoff = time.time() - 86400
+        recent = [r for r in await db.get_recent_reviews(limit=20) if (r.get("time") or 0) > cutoff]
+        if recent:
+            lines = [f"- {r['rating']}★ by {r['author']}: {(r['text'] or '')[:100]}" for r in recent]
+            sections.append("NEW REVIEWS (24h):\n" + "\n".join(lines))
+    except Exception:
+        pass
+
+    conn = await db.get_db()
+    cursor = await conn.execute(
+        "SELECT id, action_type, payload FROM pending_actions WHERE status = 'pending' ORDER BY id DESC LIMIT 5"
+    )
+    rows = await cursor.fetchall()
+    if rows:
+        lines = []
+        for r in rows:
+            p = json.loads(r["payload"])
+            lines.append(f"- {r['action_type']} to {p.get('to', '?')}: {p.get('subject', '')[:60]}")
+        sections.append("PENDING DRAFTS (still awaiting your Approve/Reject):\n" + "\n".join(lines))
+
+    if not sections:
+        logger.info("Daily digest: nothing to report, staying quiet")
+        return
+
+    try:
+        digest = await llm.compose_digest("\n\n".join(sections))
+    except Exception as e:
+        logger.error(f"Digest compose failed: {e}")
+        digest = "\n\n".join(sections)
+
+    chat_id = config.TELEGRAM_AUTHORIZED_USER_ID
+    body = "☀️ **Morning digest**\n\n" + digest
+    try:
+        await context.bot.send_message(
+            chat_id, markdown_to_telegram_html(body),
+            parse_mode="HTML", disable_web_page_preview=True,
+        )
+    except BadRequest:
+        await context.bot.send_message(chat_id, body)
 
 
 # ── Bot Setup ─────────────────────────────────────────────────────
@@ -1450,9 +2009,13 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("pin", cmd_pin))
     app.add_handler(CommandHandler("lock", cmd_lock))
-    app.add_handler(CommandHandler("switch", cmd_switch))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("audit", cmd_audit))
+    app.add_handler(CommandHandler("new", cmd_new))
+    app.add_handler(CommandHandler("memories", cmd_memories))
+    app.add_handler(CommandHandler("forget", cmd_forget))
+    app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(CommandHandler("signature", cmd_signature))
     app.add_handler(CommandHandler("accounts", cmd_accounts))
     app.add_handler(CommandHandler("addaccount", cmd_addaccount))
     app.add_handler(CommandHandler("useaccount", cmd_useaccount))
@@ -1481,6 +2044,8 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("checkreviews", cmd_checkreviews))
     app.add_handler(CallbackQueryHandler(handle_approval_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
+    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, handle_media))
 
     # Background search indexer
     index_interval = config.INDEX_POLL_INTERVAL_MINUTES * 60
@@ -1490,6 +2055,23 @@ def build_app() -> Application:
         first=60,  # first index 60s after startup
         name="search_indexer",
     )
+
+    # Deep mailbox backfill + embedding catch-up: shortly after startup, then daily
+    app.job_queue.run_repeating(
+        _background_backfill,
+        interval=24 * 3600,
+        first=120,
+        name="mailbox_backfill",
+    )
+
+    # Morning digest at the configured local hour
+    if config.DIGEST_ENABLED:
+        local_tz = datetime.now().astimezone().tzinfo
+        app.job_queue.run_daily(
+            _daily_digest,
+            time=dtime(hour=config.DIGEST_HOUR, tzinfo=local_tz),
+            name="daily_digest",
+        )
 
     # Background review polling
     if config.GOOGLE_PLACES_API_KEY:

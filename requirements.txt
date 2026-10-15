@@ -1,6 +1,6 @@
 python-telegram-bot[job-queue]==21.6
-anthropic>=0.39.0
-openai>=1.51.0
+openai>=2.0.0
+numpy>=2.0.0
 python-dotenv>=1.0.1
 aiosqlite>=0.20.0
 apscheduler>=3.10.4

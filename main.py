@@ -10,6 +10,7 @@ import signal
 import sys
 
 import db
+import search_index
 from bot import build_app
 
 logging.basicConfig(
@@ -26,6 +27,7 @@ logger = logging.getLogger("clawdbot")
 async def shutdown(app) -> None:
     logger.info("Shutting down...")
     await db.close_db()
+    await search_index.close_db()
 
 
 def main() -> None:

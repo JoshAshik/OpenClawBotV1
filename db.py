@@ -49,6 +49,32 @@ async def _init_tables(db: aiosqlite.Connection) -> None:
             value TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS chat_turns (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id    TEXT    NOT NULL,
+            timestamp     TEXT    NOT NULL,
+            role          TEXT    NOT NULL,
+            messages_json TEXT    NOT NULL,
+            llm_used      TEXT,
+            est_tokens    INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_chat_turns_session ON chat_turns(session_id, id);
+
+        CREATE TABLE IF NOT EXISTS memories (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at  TEXT    NOT NULL,
+            category    TEXT,
+            content     TEXT    NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS contacts (
+            email       TEXT    PRIMARY KEY,
+            name        TEXT,
+            count       INTEGER NOT NULL DEFAULT 0,
+            last_seen   TEXT
+        );
+
         CREATE TABLE IF NOT EXISTS properties (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             name        TEXT    NOT NULL,
@@ -117,6 +143,113 @@ async def get_recent_conversations(limit: int = 20) -> list[dict]:
     return [{"role": r["role"], "content": r["content"], "llm_used": r["llm_used"]} for r in reversed(rows)]
 
 
+# ── Structured Conversation Turns ─────────────────────────────────
+#
+# Each turn stores the normalized (provider-neutral) message list it added:
+#   {"role": "user",         "content": "<text>"}
+#   {"role": "assistant",    "content": [{"type": "text", ...}, {"type": "tool_use", ...}]}
+#   {"role": "tool_results", "content": [{"tool_use_id": ..., "content": "..."}]}
+# llm.py converts these to the OpenAI wire format on each request.
+
+def _estimate_tokens(text: str) -> int:
+    return max(1, len(text) // 4)
+
+
+async def save_turn(session_id: str, role: str, messages: list[dict], llm_used: str | None = None) -> None:
+    db = await get_db()
+    payload = json.dumps(messages, ensure_ascii=False)
+    await db.execute(
+        "INSERT INTO chat_turns (session_id, timestamp, role, messages_json, llm_used, est_tokens) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            session_id,
+            datetime.now(timezone.utc).isoformat(),
+            role,
+            payload,
+            llm_used,
+            _estimate_tokens(payload),
+        ),
+    )
+    await db.commit()
+
+
+async def get_turn_messages(session_id: str, token_budget: int) -> list[dict]:
+    """
+    Return the normalized message list for a session, newest turns first
+    until the token budget is filled, then flattened back to chronological order.
+    Whole turns are kept or dropped — never split (keeps tool_use/tool_result pairs valid).
+    """
+    db = await get_db()
+    cursor = await db.execute(
+        "SELECT messages_json, est_tokens FROM chat_turns WHERE session_id = ? ORDER BY id DESC",
+        (session_id,),
+    )
+    rows = await cursor.fetchall()
+
+    kept: list[list[dict]] = []
+    used = 0
+    for r in rows:
+        if used + r["est_tokens"] > token_budget and kept:
+            break
+        try:
+            kept.append(json.loads(r["messages_json"]))
+        except json.JSONDecodeError:
+            continue
+        used += r["est_tokens"]
+
+    messages: list[dict] = []
+    for turn in reversed(kept):
+        messages.extend(turn)
+    return messages
+
+
+async def get_last_turn_time(session_id: str) -> datetime | None:
+    db = await get_db()
+    cursor = await db.execute(
+        "SELECT timestamp FROM chat_turns WHERE session_id = ? ORDER BY id DESC LIMIT 1",
+        (session_id,),
+    )
+    row = await cursor.fetchone()
+    if row is None:
+        return None
+    try:
+        return datetime.fromisoformat(row["timestamp"])
+    except ValueError:
+        return None
+
+
+# ── Long-Term Memories ────────────────────────────────────────────
+
+async def add_memory(content: str, category: str | None = None) -> int:
+    db = await get_db()
+    cursor = await db.execute(
+        "INSERT INTO memories (created_at, category, content) VALUES (?, ?, ?)",
+        (datetime.now(timezone.utc).isoformat(), category, content),
+    )
+    await db.commit()
+    return cursor.lastrowid
+
+
+async def list_memories(limit: int = 50) -> list[dict]:
+    db = await get_db()
+    cursor = await db.execute(
+        "SELECT id, created_at, category, content FROM memories ORDER BY id DESC LIMIT ?",
+        (limit,),
+    )
+    rows = await cursor.fetchall()
+    return [
+        {"id": r["id"], "created_at": r["created_at"], "category": r["category"], "content": r["content"]}
+        for r in rows
+    ]
+
+
+async def delete_memory(memory_id: int) -> bool:
+    db = await get_db()
+    cursor = await db.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
+    await db.commit()
+    return cursor.rowcount > 0
+
+
 async def create_pending_action(action_type: str, payload: dict) -> int:
     db = await get_db()
     cursor = await db.execute(
@@ -125,6 +258,28 @@ async def create_pending_action(action_type: str, payload: dict) -> int:
     )
     await db.commit()
     return cursor.lastrowid
+
+
+async def get_pending_action(action_id: int) -> dict | None:
+    """Fetch a pending action WITHOUT resolving it (used by the Edit loop)."""
+    db = await get_db()
+    cursor = await db.execute(
+        "SELECT * FROM pending_actions WHERE id = ? AND status = 'pending'", (action_id,)
+    )
+    row = await cursor.fetchone()
+    if row is None:
+        return None
+    return {"id": row["id"], "action_type": row["action_type"], "payload": json.loads(row["payload"])}
+
+
+async def update_pending_action_payload(action_id: int, payload: dict) -> bool:
+    db = await get_db()
+    cursor = await db.execute(
+        "UPDATE pending_actions SET payload = ? WHERE id = ? AND status = 'pending'",
+        (json.dumps(payload), action_id),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
 
 
 async def resolve_pending_action(action_id: int, status: str) -> dict | None:
@@ -156,6 +311,35 @@ async def set_setting(key: str, value: str) -> None:
         (key, value, value),
     )
     await db.commit()
+
+
+# ── Contacts (built from indexed mail) ────────────────────────────
+
+async def replace_contacts(contacts: list[dict]) -> None:
+    """Atomically replace the contacts table (full rebuild from the index)."""
+    db = await get_db()
+    await db.execute("DELETE FROM contacts")
+    await db.executemany(
+        "INSERT OR REPLACE INTO contacts (email, name, count, last_seen) VALUES (?, ?, ?, ?)",
+        [(c["email"].lower(), c.get("name", ""), c.get("count", 1), c.get("last_seen", "")) for c in contacts],
+    )
+    await db.commit()
+
+
+async def search_contacts(name_or_email: str, limit: int = 5) -> list[dict]:
+    db = await get_db()
+    like = f"%{name_or_email.lower()}%"
+    cursor = await db.execute(
+        "SELECT email, name, count, last_seen FROM contacts "
+        "WHERE lower(name) LIKE ? OR email LIKE ? "
+        "ORDER BY count DESC LIMIT ?",
+        (like, like, limit),
+    )
+    rows = await cursor.fetchall()
+    return [
+        {"email": r["email"], "name": r["name"], "count": r["count"], "last_seen": r["last_seen"]}
+        for r in rows
+    ]
 
 
 # ── Property & Review Helpers ─────────────────────────────────────
