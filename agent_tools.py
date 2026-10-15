@@ -59,7 +59,16 @@ def action_detail(action_type: str, payload: dict) -> str:
         if payload.get("html"):
             lines.append("_(HTML formatting)_")
         return "\n".join(lines) + f"\n\n{payload.get('body', '')}"
+    if action_type == "send_imessage":
+        return (f"*To:* {message_recipient_label(payload)} via {payload.get('service', 'iMessage')}"
+                f"\n\n{payload.get('body', '')}")
     return json.dumps(payload, indent=2)[:1500]
+
+
+def message_recipient_label(payload: dict) -> str:
+    """'Mike Plumber (+14155550101)' or just the handle when the name is unknown."""
+    to, name = payload.get("to", "?"), payload.get("to_name", "")
+    return f"{name} ({to})" if name and name != to else to
 
 
 TOOL_SCHEMAS = [
@@ -212,16 +221,58 @@ TOOL_SCHEMAS = [
         },
     },
     {
-        "name": "find_contact",
+        "name": "send_imessage",
         "description": (
-            "Look up a person's email address from past correspondence. Use whenever the user "
-            "names a person without giving an address ('email John about the rent'). "
-            "Returns matches ranked by how often you've corresponded."
+            "Send a text message (iMessage, or SMS) from the user's Mac. Use when the user asks "
+            "to text, message, or iMessage someone. `to` may be a phone number, an iMessage "
+            "email handle, or a person's name (resolved from Contacts and past messages; if the "
+            "name is ambiguous you'll be told to ask which). The message is shown to the user "
+            "for approval before anything is sent — NEVER say it was sent; say it's ready for "
+            "their approval. WhatsApp sending is not available."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "name": {"type": "string", "description": "The person's name (or partial email address)"},
+                "to": {"type": "string", "description": "Phone number, iMessage email handle, or the person's name"},
+                "body": {"type": "string", "description": "The message text (plain, conversational — no signature)"},
+                "service": {"type": "string", "enum": ["iMessage", "SMS"], "description": "Defaults to iMessage"},
+            },
+            "required": ["to", "body"],
+        },
+    },
+    {
+        "name": "get_conversation",
+        "description": (
+            "Pull up the live message timeline with one person or one group chat (iMessage/SMS, "
+            "or WhatsApp) — 'what did Mike say', 'latest from the tenant', 'my texts with Sara "
+            "last week'. Complete and in order, straight from the Messages database, with dates. "
+            "For topic searches across people or sources use search_everything instead."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "contact": {"type": "string", "description": "Person's name, phone number, email handle, or a group chat's name"},
+                "after": {"type": "string", "description": "Only messages on/after this date, YYYY-MM-DD"},
+                "before": {"type": "string", "description": "Only messages on/before this date, YYYY-MM-DD"},
+                "limit": {"type": "integer", "description": "Newest N messages (default 40, max 200)"},
+                "source": {"type": "string", "enum": ["imessage", "whatsapp"], "description": "Default imessage"},
+            },
+            "required": ["contact"],
+        },
+    },
+    {
+        "name": "find_contact",
+        "description": (
+            "Look up a person's email address and phone number(s) from Contacts and past "
+            "correspondence (email, iMessage, WhatsApp). Use whenever the user names a person "
+            "without giving an address or number ('email John about the rent', 'text Mike'). "
+            "Returns matches ranked by how often you've interacted, with the channels each "
+            "person has been reached on, so you can pick email vs. message."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "The person's name, or a partial email address or phone number"},
             },
             "required": ["name"],
         },
@@ -240,6 +291,46 @@ TOOL_SCHEMAS = [
                 "category": {"type": "string", "description": "Optional: 'preference', 'contact', 'property', or 'fact'"},
             },
             "required": ["fact"],
+        },
+    },
+    {
+        "name": "list_waiting_on",
+        "description": (
+            "What the user is still waiting on: emails and texts they sent that got no reply "
+            "for a few days ('who hasn't replied?', 'what am I waiting on?'). Returns ids so "
+            "you can draft a nudge with reply_email or send_imessage if asked."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "set_reminder",
+        "description": (
+            "Set a reminder the bot will send to the user at a specific time ('remind me Thursday "
+            "to chase the deposit'). Compute `when` as an ABSOLUTE local date/time from the current "
+            "date/time in your instructions — never pass relative words. The reminder is delivered "
+            "as a Telegram message with Snooze / Done buttons; it is not sent to anyone else."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "when": {"type": "string", "description": "ISO local date/time, e.g. 2026-10-17T09:00 (a date alone means 09:00)"},
+                "text": {"type": "string", "description": "What to remind about, phrased as a short imperative"},
+            },
+            "required": ["when", "text"],
+        },
+    },
+    {
+        "name": "list_reminders",
+        "description": "List pending reminders with their ids and times.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "cancel_reminder",
+        "description": "Cancel a pending reminder by id (from list_reminders or a set_reminder result).",
+        "input_schema": {
+            "type": "object",
+            "properties": {"id": {"type": "integer", "description": "Reminder id"}},
+            "required": ["id"],
         },
     },
     {
@@ -428,6 +519,249 @@ async def _fuzzy_index_lookup(source: str, source_id: str) -> str | None:
     return None
 
 
+async def build_reply_action(email_id: str, account: str | None, body: str,
+                             cc: str = "", bcc: str = "", attachments: list | None = None) -> dict:
+    """
+    Pending reply_email action for an existing message (threading metadata fetched
+    live). Shared by the reply_email tool and the waiting-on Nudge. Raises if the
+    message can't be found in any connected account.
+    """
+    import asyncio
+
+    meta, used_acct = await asyncio.to_thread(
+        _gmail_with_fallback, gmail_module.get_message_meta, email_id, account
+    )
+    to = meta["reply_to"] or meta["from"]
+    subject = meta["subject"]
+    if not subject.lower().startswith("re:"):
+        subject = f"Re: {subject}"
+    payload = {
+        "email_id": email_id, "body": body, "account": used_acct,
+        "to": to, "subject": subject, "cc": cc, "bcc": bcc,
+        "attachments": attachments or [],
+    }
+    return {
+        "type": "reply_email",
+        "payload": payload,
+        "summary": f"Reply to {to}",
+        "detail": action_detail("reply_email", payload),
+    }
+
+
+def build_imessage_action(to: str, to_name: str, body: str, service: str = "iMessage") -> dict:
+    """Pending send_imessage action. Shared by the send_imessage tool and the Nudge."""
+    payload = {"to": to, "to_name": to_name or "", "body": body,
+               "service": "SMS" if (service or "").upper() == "SMS" else "iMessage"}
+    return {
+        "type": "send_imessage",
+        "payload": payload,
+        "summary": f"Text to {payload['to_name'] or payload['to']}",
+        "detail": action_detail("send_imessage", payload),
+    }
+
+
+async def resolve_message_recipient(to_raw: str) -> dict:
+    """
+    Turn `to` (handle or name) into {to: handle, to_name, note} or {error: text}.
+
+    A phone/email handle is normalized and named from the contacts table if known.
+    A name must match exactly one person who has a phone (or an email handle already
+    seen on iMessage); several plausible people → error asking which; none → error
+    asking for the number. The approval card is the user's confirmation step.
+    """
+    from contacts_module import normalize_handle
+
+    handle = normalize_handle(to_raw)
+    if handle:
+        name = ""
+        for m in await db.search_contacts(handle, limit=5):
+            if handle in m.get("phones", []) or handle in m.get("emails", []):
+                name = m.get("name") or ""
+                break
+        return {"to": handle, "to_name": name}
+
+    matches = await db.search_contacts(to_raw, limit=8)
+    candidates = []
+    for m in matches:
+        if m.get("phones"):
+            candidates.append((m, m["phones"][0], m["phones"][1:]))
+        elif "imessage" in (m.get("channels") or []) and m.get("emails"):
+            candidates.append((m, m["emails"][0], []))
+    if len(candidates) == 1:
+        m, to, alternates = candidates[0]
+        note = f"(Other numbers for them: {', '.join(alternates)}.)" if alternates else ""
+        return {"to": to, "to_name": m.get("name") or to_raw, "note": note}
+    if len(candidates) > 1:
+        options = "; ".join(f"{m.get('name') or '?'} {to}" for m, to, _ in candidates)
+        return {"error": f"Several people match '{to_raw}': {options}. Ask the user which one "
+                         "(or which number), then call send_imessage with that number."}
+    if matches:
+        names = ", ".join(m.get("name") or m.get("email") or "?" for m in matches[:3])
+        return {"error": f"Found {names} but no phone number or iMessage handle on file for "
+                         f"'{to_raw}'. Ask the user for the number."}
+    return {"error": f"No contact matching '{to_raw}'. Ask the user for the phone number."}
+
+
+async def resolve_conversation_target(contact: str, groups: bool = True) -> dict:
+    """
+    Who/what `contact` refers to for get_conversation:
+      {handles: [...], chat_key, name}            a person (handle or unique name match)
+      {chat_key, name, is_group: True}            a group chat by display name
+      {error: text}                               ambiguous or unknown
+    """
+    import asyncio
+
+    from contacts_module import normalize_handle
+
+    raw = contact.strip()
+    needle = raw.lower()
+
+    key = normalize_handle(raw)
+    if key:
+        name = ""
+        for m in await db.search_contacts(key, limit=5):
+            if key in m.get("phones", []) or key in m.get("emails", []):
+                name = m.get("name") or ""
+                break
+        handles = list(dict.fromkeys([key, raw]))
+        return {"handles": handles, "chat_key": f"handle:{key}", "name": name or key}
+
+    if groups:
+        try:
+            import imessage_module
+            chats = await asyncio.to_thread(imessage_module.list_chats, 200)
+        except Exception:
+            chats = []
+        hits = [c for c in chats if c.get("is_group") and needle in (c.get("display_name") or "").lower()]
+        exact = [c for c in hits if (c.get("display_name") or "").lower() == needle]
+        if len(exact) == 1 or len(hits) == 1:
+            c = (exact or hits)[0]
+            return {"chat_key": c["chat_key"], "name": c["display_name"], "is_group": True}
+        if len(hits) > 1:
+            names = ", ".join(f"\"{c['display_name']}\"" for c in hits[:5])
+            return {"error": f"Several group chats match '{raw}': {names}. Ask the user which one."}
+
+    matches = [m for m in await db.search_contacts(raw, limit=8) if m.get("phones") or m.get("emails")]
+    exact = [m for m in matches if (m.get("name") or "").lower() == needle]
+    if len(exact) == 1 or len(matches) == 1:
+        m = (exact or matches)[0]
+        handles = list(m.get("phones", [])) + list(m.get("emails", []))
+        return {"handles": handles, "chat_key": f"handle:{handles[0]}", "name": m.get("name") or raw}
+    if len(matches) > 1:
+        names = "; ".join(f"{m.get('name') or '?'} ({', '.join((m.get('phones') or m.get('emails'))[:1])})"
+                          for m in matches[:5])
+        return {"error": f"Several people match '{raw}': {names}. Ask the user which one."}
+    return {"error": f"No contact or group chat matching '{raw}'. Ask for their number, or try "
+                     "search_everything with a topic instead."}
+
+
+def _fmt_local(iso: str) -> str:
+    from datetime import datetime
+    try:
+        return datetime.fromisoformat(iso).astimezone().strftime("%Y-%m-%d %H:%M")
+    except (ValueError, TypeError):
+        return (iso or "")[:16].replace("T", " ")
+
+
+def format_timeline(msgs: list[dict], resolve, label: str, name: str, limit: int,
+                    span_note: str = "") -> str:
+    lines = []
+    for m in msgs:
+        who = "Me" if m.get("is_from_me") else resolve(m.get("sender") or m.get("contact") or "?")
+        line = f"[{_fmt_local(m.get('date', ''))}] {who}: {m.get('text', '')}"
+        atts = m.get("attachments") or []
+        if atts:
+            line += f" [attachments: {', '.join(atts)}]"
+        lines.append(line)
+    header = (f"{label} with {name} — {len(msgs)} message(s), "
+              f"{_fmt_local(msgs[0].get('date', ''))} → {_fmt_local(msgs[-1].get('date', ''))}{span_note}")
+    if len(msgs) >= limit:
+        header += f" (newest {limit}; raise limit or narrow the dates for more)"
+    return header + "\n" + "\n".join(lines)
+
+
+async def get_conversation(args: dict) -> dict:
+    """get_conversation tool: live timeline for one person or group chat."""
+    import asyncio
+
+    contact = (args.get("contact") or "").strip()
+    if not contact:
+        return {"result": "get_conversation needs a contact: a name, number, email handle, or group chat name."}
+    source = (args.get("source") or "imessage").lower()
+    try:
+        limit = max(1, min(int(args.get("limit") or 40), 200))
+    except (TypeError, ValueError):
+        limit = 40
+    after = _parse_filter_date(args.get("after"))
+    before = _parse_filter_date(args.get("before"), end_of_day=True)
+    span_note = ""
+    if after or before:
+        span_note = " (filtered" + (f" from {args.get('after')}" if after else "") \
+                    + (f" to {args.get('before')}" if before else "") + ")"
+
+    if source == "whatsapp":
+        return await _whatsapp_conversation(contact, after, before, limit, span_note)
+
+    import contacts_module
+    import imessage_module
+    if not imessage_module.is_available():
+        return {"result": "iMessage isn't available on this machine (Mac only). Try search_everything."}
+
+    target = await resolve_conversation_target(contact)
+    if target.get("error"):
+        return {"result": target["error"]}
+
+    msgs = await asyncio.to_thread(
+        imessage_module.get_timeline,
+        None if target.get("is_group") else target.get("handles"),
+        target["chat_key"] if target.get("is_group") else None,
+        after.isoformat() if after else None,
+        before.isoformat() if before else None,
+        limit,
+    )
+    label = "iMessage group chat" if target.get("is_group") else "iMessage/SMS conversation"
+    name = target["name"]
+    entities = [{"type": "imessage_chat", "id": target["chat_key"], "label": name[:80]}]
+    if not msgs:
+        return {"result": f"No messages found for {label} with {name}{span_note}.", "entities": entities}
+    resolve = await asyncio.to_thread(contacts_module.resolver_fn)
+    return {"result": format_timeline(msgs, resolve, label, name, limit, span_note),
+            "entities": entities}
+
+
+async def _whatsapp_conversation(contact: str, after, before, limit: int, span_note: str) -> dict:
+    import asyncio
+
+    import contacts_module
+    import whatsapp_module
+    if not whatsapp_module.is_available():
+        return {"result": "WhatsApp isn't available on this machine (Mac only, WhatsApp app linked). "
+                          "Try search_everything with source=whatsapp for indexed history."}
+    try:
+        msgs = await asyncio.to_thread(whatsapp_module.get_messages_from_contact, contact,
+                                       limit=max(limit * 3, 200))
+    except Exception as e:
+        return {"result": f"WhatsApp read failed: {e}"}
+    kept = []
+    for m in msgs:  # newest first from the reader
+        dt = _parse_filter_date(m.get("date", ""))
+        if after and (dt is None or dt < after):
+            continue
+        if before and (dt is None or dt >= before):
+            continue
+        kept.append(m)
+        if len(kept) >= limit:
+            break
+    kept.reverse()
+    name = kept[0].get("contact") if kept else contact
+    entities = [{"type": "whatsapp_chat", "id": f"handle:{name}", "label": str(name)[:80]}]
+    if not kept:
+        return {"result": f"No WhatsApp messages found with {contact}{span_note}.", "entities": entities}
+    resolve = await asyncio.to_thread(contacts_module.resolver_fn)
+    return {"result": format_timeline(kept, resolve, "WhatsApp conversation", name, limit, span_note),
+            "entities": entities}
+
+
 async def _index_fallback(email_id: str, account: str | None) -> str | None:
     """Try to retrieve email/PDF content from the search index when Gmail is unreachable."""
     # Try exact matches first: "account:msg_id"
@@ -572,49 +906,115 @@ async def execute_tool(name: str, args: dict) -> dict:
         elif name == "reply_email":
             email_id, account = _resolve_email_id(args)
             try:
-                meta, used_acct = await asyncio.to_thread(
-                    _gmail_with_fallback, gmail_module.get_message_meta, email_id, account
+                action = await build_reply_action(
+                    email_id, account, args["body"],
+                    cc=args.get("cc", ""), bcc=args.get("bcc", ""),
+                    attachments=args.get("attachments") or [],
                 )
-                to = meta["reply_to"] or meta["from"]
-                subject = meta["subject"]
-                if not subject.lower().startswith("re:"):
-                    subject = f"Re: {subject}"
             except Exception as e:
                 logger.warning(f"reply_email meta lookup failed for {email_id}: {e}")
                 return {"result": f"Could not find the email to reply to ({email_id}): {e}"}
-
-            payload = {
-                "email_id": email_id, "body": args["body"], "account": used_acct,
-                "to": to, "subject": subject,
-                "cc": args.get("cc", ""), "bcc": args.get("bcc", ""),
-                "attachments": args.get("attachments") or [],
-            }
+            p = action["payload"]
             return {
-                "result": f"Reply prepared to {to}, subject '{subject}'. Awaiting user approval.",
-                "action": {
-                    "type": "reply_email",
-                    "payload": payload,
-                    "summary": f"Reply to {to}",
-                    "detail": action_detail("reply_email", payload),
-                },
-                "entities": [{"type": "email", "id": email_id, "account": used_acct,
-                              "label": f"{subject[:60]} (replying)"}],
+                "result": f"Reply prepared to {p['to']}, subject '{p['subject']}'. Awaiting user approval.",
+                "action": action,
+                "entities": [{"type": "email", "id": email_id, "account": p["account"],
+                              "label": f"{p['subject'][:60]} (replying)"}],
             }
+
+        elif name == "send_imessage":
+            # WRITE action — resolve the recipient, then hand back for approval. Never sends.
+            to_raw = (args.get("to") or "").strip()
+            body = (args.get("body") or "").strip()
+            service = "SMS" if str(args.get("service") or "").upper() == "SMS" else "iMessage"
+            if not to_raw or not body:
+                return {"result": "send_imessage needs both `to` and `body`."}
+
+            resolved = await resolve_message_recipient(to_raw)
+            if resolved.get("error"):
+                return {"result": resolved["error"]}
+
+            action = build_imessage_action(resolved["to"], resolved.get("to_name", ""), body, service)
+            label = message_recipient_label(action["payload"])
+            note = f" {resolved['note']}" if resolved.get("note") else ""
+            return {
+                "result": f"Message prepared to {label} via {service}. Awaiting user approval.{note}",
+                "action": action,
+            }
+
+        elif name == "list_waiting_on":
+            import waiting_on
+            items = await waiting_on.list_waiting()
+            entities = []
+            for it in items[:8]:
+                if it["kind"] == "email":
+                    entities.append({"type": "email", "id": it["email_id"], "account": it["account"],
+                                     "label": f"{it['subject'][:50]} (waiting {it['days_waiting']}d)"})
+                else:
+                    entities.append({"type": "imessage_chat", "id": it["chat_key"],
+                                     "label": f"{it['contact']} (waiting {it['days_waiting']}d)"})
+            return {"result": waiting_on.format_waiting(items), "entities": entities}
+
+        elif name == "get_conversation":
+            return await get_conversation(args)
 
         elif name == "find_contact":
             matches = await db.search_contacts(args["name"], limit=5)
             if not matches:
-                return {"result": f"No contact matching '{args['name']}' in past correspondence. "
-                                  "Ask the user for the email address."}
+                return {"result": f"No contact matching '{args['name']}' in Contacts or past "
+                                  "correspondence. Ask the user for the email address or number."}
             lines = []
             for m in matches:
                 nm = m["name"] or "(no name)"
-                lines.append(f"- {nm} <{m['email']}> — {m['count']} emails, last {m['last_seen'][:10]}")
+                parts = []
+                if m.get("emails"):
+                    parts.append("email " + ", ".join(m["emails"][:3]))
+                if m.get("phones"):
+                    parts.append("phone " + ", ".join(m["phones"][:3]))
+                channels = ", ".join(m.get("channels") or []) or "unknown"
+                last = f", last {m['last_seen'][:10]}" if m.get("last_seen") else ""
+                lines.append(f"- {nm}: {'; '.join(parts) or 'no address'} — channels: {channels}; "
+                             f"{m['count']} interactions{last}")
             return {"result": "Contact matches (most frequent first):\n" + "\n".join(lines)}
 
         elif name == "remember":
             memory_id = await db.add_memory(args["fact"], args.get("category"))
             return {"result": f"Saved to memory (#{memory_id}): {args['fact']}"}
+
+        elif name == "set_reminder":
+            import reminders
+            text = (args.get("text") or "").strip()
+            if not text:
+                return {"result": "set_reminder needs `text` (what to remind about)."}
+            try:
+                due = reminders.parse_when(args.get("when", ""))
+            except ValueError as e:
+                return {"result": f"Can't set that reminder: {e}. Pass an absolute ISO local time."}
+            rid = await db.add_reminder(text, due.isoformat())
+            label = f"{reminders.fmt_local(due)}: {text}"
+            return {"result": f"Reminder #{rid} set for {label}.",
+                    "entities": [{"type": "reminder", "id": str(rid), "label": label[:80]}]}
+
+        elif name == "list_reminders":
+            import reminders
+            pending = await db.list_reminders("pending", limit=30)
+            if not pending:
+                return {"result": "No pending reminders."}
+            return {"result": "Pending reminders:\n" + "\n".join(reminders.describe(r) for r in pending),
+                    "entities": [{"type": "reminder", "id": str(r["id"]),
+                                  "label": f"{reminders.fmt_local(r['due_at'])}: {r['text']}"[:80]}
+                                 for r in pending[:5]]}
+
+        elif name == "cancel_reminder":
+            try:
+                rid = int(args.get("id"))
+            except (TypeError, ValueError):
+                return {"result": "cancel_reminder needs a numeric id."}
+            r = await db.get_reminder(rid)
+            if r is None or r["status"] != "pending":
+                return {"result": f"No pending reminder #{rid}."}
+            await db.mark_reminder(rid, "cancelled")
+            return {"result": f"Cancelled reminder #{rid}: {r['text']}"}
 
         elif name == "check_reviews":
             import reviews

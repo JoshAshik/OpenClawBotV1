@@ -405,6 +405,56 @@ def get_messages_from_contact(contact: str, limit: int = 100) -> list[dict]:
         conn.close()
 
 
+def get_timeline(handles: list[str] | None = None, chat_key: str | None = None,
+                 after_iso: str | None = None, before_iso: str | None = None,
+                 limit: int = 40) -> list[dict]:
+    """
+    The newest `limit` usable messages, returned in chronological order, for either
+    one chat (`chat_key` = "chat:<id>" / "handle:<id>") or everything involving any of
+    `handles`: their 1:1 chat (both directions) plus what they sent in group chats.
+    `after_iso` is inclusive, `before_iso` exclusive. Live read, not the index.
+    """
+    clauses: list[str] = []
+    params: list[object] = []
+    if chat_key:
+        kind, _, ident = chat_key.partition(":")
+        if kind == "chat":
+            clauses.append("c.ROWID = ?")
+            params.append(int(ident))
+        else:
+            clauses.append("c.ROWID IS NULL AND h.id = ?")
+            params.append(ident)
+    elif handles:
+        hs = [h for h in handles if h]
+        if not hs:
+            return []
+        marks = ",".join("?" * len(hs))
+        clauses.append(f"(c.chat_identifier IN ({marks}) OR h.id IN ({marks}))")
+        params.extend(hs)
+        params.extend(hs)
+    else:
+        return []
+    if after_iso:
+        clauses.append("m.date >= ?")
+        params.append(iso_to_apple_ns(after_iso))
+    if before_iso:
+        clauses.append("m.date < ?")
+        params.append(iso_to_apple_ns(before_iso))
+
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            _MESSAGE_SELECT + f" WHERE {_USABLE_WHERE} AND " + " AND ".join(clauses)
+            + " ORDER BY m.date DESC LIMIT ?",
+            (*params, max(1, limit)),
+        )
+        msgs = _rows_to_messages(conn, cur.fetchall())
+        msgs.reverse()
+        return msgs
+    finally:
+        conn.close()
+
+
 def search_messages(query: str, limit: int = 50, scan_limit: int = 50_000) -> list[dict]:
     """
     Case-insensitive substring search over message bodies, newest first. Bodies that

@@ -77,6 +77,54 @@ def fmt_ts(raw: str | None) -> str:
         return raw
 
 
+# ── Usage / cost ───────────────────────────────────────────────────
+
+def day_start_iso(now: datetime | None = None) -> str:
+    local = (now or datetime.now(timezone.utc)).astimezone()
+    return local.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc).isoformat()
+
+
+def month_start_iso(now: datetime | None = None) -> str:
+    local = (now or datetime.now(timezone.utc)).astimezone()
+    return local.replace(day=1, hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc).isoformat()
+
+
+def _money(x: float) -> str:
+    return f"${x:.2f}" if x >= 0.1 else f"${x:.4f}"
+
+
+def _tokens(n: int) -> str:
+    return f"{n / 1000:.1f}k" if n >= 1000 else str(n)
+
+
+def format_usage(today: dict, month: dict, top: list[dict]) -> str:
+    """Plain-text /usage report from db.usage_summary + db.top_turns."""
+    lines = [
+        f"💵 Usage — today {_money(today['cost'])} ({today['calls']} calls, "
+        f"{_tokens(today['prompt'] + today['completion'])} tokens, {_tokens(today['cached'])} cached)",
+        f"Month to date: {_money(month['cost'])} ({month['calls']} calls, "
+        f"{_tokens(month['prompt'] + month['completion'])} tokens)",
+    ]
+    if month["by_purpose"]:
+        lines.append("\nBy purpose (month):")
+        lines += [f"- {p['key']}: {_money(p['cost'])} · {p['calls']} calls · {_tokens(p['tokens'])} tokens"
+                  for p in month["by_purpose"]]
+    if month["by_model"]:
+        lines.append("\nBy model (month):")
+        lines += [f"- {m['key']}: {_money(m['cost'])} · {m['calls']} calls" for m in month["by_model"]]
+    if top:
+        lines.append("\nMost expensive turns (month):")
+        lines += [f"- {_money(t['cost_usd'])} · {t['timestamp'][:16].replace('T', ' ')} · "
+                  f"{_tokens(t['prompt_tokens'])} in / {_tokens(t['completion_tokens'])} out"
+                  + (f' — "{t["label"]}"' if t.get("label") else "")
+                  for t in top]
+    if month.get("unpriced"):
+        lines.append(f"\n⚠️ {month['unpriced']} call(s) used a model with no price in PRICES_PER_MTOK "
+                     "(counted as $0) — update config.py.")
+    lines.append("\nPrices come from config.PRICES_PER_MTOK — keep them in sync with OpenAI's pricing page.")
+    return "\n".join(lines)
+
+
 # ── Doctor ─────────────────────────────────────────────────────────
 
 def _check(name: str, status: str, detail: str = "") -> dict:
@@ -154,13 +202,9 @@ def _probe_sqlite(path: Path, probe_sql: str) -> tuple[str, str]:
 
 
 def _contacts_db_path() -> Path | None:
-    base = Path.home() / "Library" / "Application Support" / "AddressBook"
-    candidates = [base / "AddressBook-v22.abcddb"]
-    candidates += sorted((base / "Sources").glob("*/AddressBook-v22.abcddb")) if (base / "Sources").exists() else []
-    for c in candidates:
-        if c.exists():
-            return c
-    return None
+    import contacts_module
+    paths = contacts_module.db_paths()
+    return paths[0] if paths else None
 
 
 def _check_mac_sources_sync() -> list[dict]:

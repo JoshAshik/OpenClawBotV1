@@ -17,6 +17,57 @@ logger = logging.getLogger(__name__)
 # Log unavailable sources once, not every poll cycle.
 _unavailable_logged: set[str] = set()
 
+# ── New-item queue (Phase 10 alerts) ─────────────────────────────
+#
+# Every freshly indexed email / message window is also appended here so the alerts
+# job can triage it. Items older than ALERT_MAX_AGE_HOURS (backfill) are not queued,
+# and the queue is capped so a burst can't grow unbounded. Return values of the
+# indexing functions are unchanged.
+
+NEW_ITEMS_CAP = 500
+new_items: list[dict] = []
+
+
+def _now():
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc)
+
+
+def _item_age_hours(meta: dict) -> float | None:
+    from datetime import timezone
+
+    from search_index import _parse_item_date
+
+    dt = _parse_item_date(meta or {})
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return (_now() - dt).total_seconds() / 3600
+
+
+def note_new_item(source: str, source_id: str, title: str, content: str, meta: dict) -> bool:
+    """Queue a newly indexed item for alert triage. Returns True if queued."""
+    import config
+
+    age = _item_age_hours(meta)
+    if age is None or age > config.ALERT_MAX_AGE_HOURS:
+        return False
+    snippet = " ".join((content or "").split())[:300]
+    new_items.append({
+        "source": source, "source_id": source_id, "title": title or "", "snippet": snippet,
+        "meta": dict(meta or {}), "indexed_at": _now().isoformat(),
+    })
+    if len(new_items) > NEW_ITEMS_CAP:
+        del new_items[: len(new_items) - NEW_ITEMS_CAP]
+    return True
+
+
+def drain_new_items() -> list[dict]:
+    items = list(new_items)
+    new_items.clear()
+    return items
+
 
 def _log_unavailable_once(source: str, reason: str) -> None:
     if source not in _unavailable_logged:
@@ -60,6 +111,7 @@ async def _index_email_by_id(msg_id: str, account: str | None, account_label: st
 
     await search_index.index_item("gmail", source_id, title, content, metadata)
     await embeddings.embed_item("gmail", source_id, title, content)
+    note_new_item("gmail", source_id, title, full.get("body", ""), metadata)
     return True
 
 
@@ -227,8 +279,10 @@ def build_conversation_windows(messages: list[dict], label: str,
     source_id is "<chat_key>|<window start ISO>", stable across runs: a window that
     grew re-indexes as a content change (needs_reindex), not a new document.
 
-    `resolve_name(handle) -> str` is the hook for Contacts name resolution (a later
-    Phase 8 task); it defaults to identity, so titles use the raw handle until then.
+    `resolve_name(handle) -> str` maps handles to Contacts names (contacts_module);
+    it defaults to identity, so titles use the raw handle when Contacts is unavailable.
+    Metadata keeps the raw handles (`handle` for 1:1, `handles` for every sender) so
+    the contacts rebuild can count message traffic per person.
     """
     from datetime import timedelta
 
@@ -257,12 +311,16 @@ def build_conversation_windows(messages: list[dict], label: str,
                 windows.append(current)
             current = {
                 "key": key, "first": m, "start_dt": dt, "last_dt": dt,
-                "lines": [], "count": 0, "senders": [], "attachments": [], "services": [],
+                "lines": [], "count": 0, "senders": [], "handles": [],
+                "attachments": [], "services": [],
             }
         if m.get("is_from_me"):
             who = "Me"
         else:
-            who = resolve(m.get("sender") or m.get("contact") or "Unknown")
+            raw = m.get("sender") or m.get("contact") or "Unknown"
+            who = resolve(raw)
+            if raw not in current["handles"]:
+                current["handles"].append(raw)
         if who not in current["senders"]:
             current["senders"].append(who)
         line = f"[{dt.astimezone().strftime('%Y-%m-%d %H:%M')}] {who}: {m['text']}"
@@ -283,11 +341,13 @@ def build_conversation_windows(messages: list[dict], label: str,
     for w in windows:
         first = w["first"]
         stamp = w["start_dt"].astimezone().strftime("%Y-%m-%d %H:%M")
+        handle = ""
         if first.get("is_group"):
             contact = first.get("display_name") or first.get("contact") or "group"
             title = f"{label} group \"{contact}\" ({stamp})"
         else:
-            contact = resolve(first.get("contact") or "Unknown")
+            handle = first.get("contact") or "Unknown"
+            contact = resolve(handle)
             title = f"{label} with {contact} ({stamp})"
         docs.append({
             "source_id": f"{w['key']}|{w['start_dt'].isoformat()}",
@@ -295,6 +355,8 @@ def build_conversation_windows(messages: list[dict], label: str,
             "content": "\n".join(w["lines"]),
             "metadata": {
                 "contact": contact,
+                "handle": handle,
+                "handles": w["handles"],
                 "chat_key": w["key"],
                 "chat_id": first.get("chat_id"),
                 "is_group": bool(first.get("is_group")),
@@ -325,6 +387,9 @@ async def _index_message_windows(source: str, docs: list[dict]) -> int:
             source, doc["source_id"], doc["title"], doc["content"], doc["metadata"]
         )
         await embeddings.embed_item(source, doc["source_id"], doc["title"], doc["content"])
+        # A window re-indexes as it grows; only its newest line matters for alerts.
+        last_line = (doc["content"] or "").strip().splitlines()[-1:] or [""]
+        note_new_item(source, doc["source_id"], doc["title"], last_line[0], doc["metadata"])
         indexed += 1
     return indexed
 
@@ -356,6 +421,14 @@ def _imessage_window_context(messages: list[dict], cursor: int) -> list[dict]:
     return context
 
 
+# One iMessage indexing pass at a time: the 10-minute search_indexer job and the
+# 30-second chat.db watcher both call index_imessage.
+_imessage_lock = asyncio.Lock()
+
+# (chat.db mtime_ns, chat.db-wal mtime_ns) as of the watcher's last successful check.
+_watch_mtimes: tuple[int, int] | None = None
+
+
 async def index_imessage(limit: int | None = None, max_batches: int | None = None,
                          resolve_name=None) -> int:
     """
@@ -365,8 +438,60 @@ async def index_imessage(limit: int | None = None, max_batches: int | None = Non
     chat.db in pages of `limit` (default config.IMESSAGE_BATCH_SIZE) and later runs only
     read rows added since. Each batch is widened with the earlier messages of the chats
     it touches so an open conversation re-indexes as one growing document.
-    Returns the number of windows (re)indexed.
+    Returns the number of windows (re)indexed. Serialized by _imessage_lock.
     """
+    async with _imessage_lock:
+        return await _index_imessage_unlocked(limit, max_batches, resolve_name)
+
+
+def _chat_db_mtimes() -> tuple[int, int]:
+    """Cheap change signal: mtimes of chat.db and its WAL (0 when absent)."""
+    import imessage_module
+
+    path = imessage_module.db_path()
+    wal = path.with_name(path.name + "-wal")
+
+    def _mtime(p) -> int:
+        try:
+            return p.stat().st_mtime_ns
+        except OSError:
+            return 0
+
+    return _mtime(path), _mtime(wal)
+
+
+async def watch_imessage_once() -> int:
+    """
+    Near-realtime hook (bot job every IMESSAGE_WATCH_SECONDS): index new rows only
+    when chat.db changed since the last check. The first call just records a baseline
+    (the main indexer job does the initial pass). Silent when nothing changed; if a
+    full pass is already running the check is retried next tick instead of queueing.
+    """
+    global _watch_mtimes
+    try:
+        import imessage_module
+    except ImportError:
+        return 0
+    if not imessage_module.is_available():
+        return 0
+
+    mtimes = await asyncio.to_thread(_chat_db_mtimes)
+    if mtimes == _watch_mtimes:
+        return 0
+    if _watch_mtimes is None:
+        _watch_mtimes = mtimes
+        return 0
+    if _imessage_lock.locked():
+        return 0  # leave _watch_mtimes as is so the change is picked up next tick
+    _watch_mtimes = mtimes
+    indexed = await index_imessage()
+    if indexed:
+        logger.info(f"iMessage watch: {indexed} window(s) indexed")
+    return indexed
+
+
+async def _index_imessage_unlocked(limit: int | None, max_batches: int | None,
+                                   resolve_name) -> int:
     try:
         import imessage_module
     except ImportError:
@@ -378,6 +503,9 @@ async def index_imessage(limit: int | None = None, max_batches: int | None = Non
 
     import config
     import db
+
+    if resolve_name is None:
+        resolve_name = await _contacts_resolver()
 
     page = limit or config.IMESSAGE_BATCH_SIZE
     try:
@@ -413,7 +541,20 @@ async def index_imessage(limit: int | None = None, max_batches: int | None = Non
     return indexed
 
 
-async def index_whatsapp(limit: int = 500) -> int:
+async def _contacts_resolver():
+    """resolve_name callable from Apple Contacts (identity when unavailable). Thread-safe
+    load; the module caches the resolver for an hour."""
+    try:
+        import contacts_module
+    except ImportError:
+        return _identity
+    if not contacts_module.is_available():
+        _log_unavailable_once("Contacts", "AddressBook store not found (Mac only)")
+        return _identity
+    return await asyncio.to_thread(contacts_module.resolver_fn)
+
+
+async def index_whatsapp(limit: int = 500, resolve_name=None) -> int:
     """Index recent WhatsApp messages as windows. Mac only (WhatsApp Desktop)."""
     try:
         from whatsapp_module import is_available, get_recent_messages
@@ -430,7 +571,9 @@ async def index_whatsapp(limit: int = 500) -> int:
         logger.error(f"WhatsApp index failed: {e}")
         return 0
 
-    docs = _build_conversation_windows(messages, "WhatsApp")
+    if resolve_name is None:
+        resolve_name = await _contacts_resolver()
+    docs = _build_conversation_windows(messages, "WhatsApp", resolve_name)
     indexed = await _index_message_windows("whatsapp", docs)
     if indexed:
         logger.info(f"WhatsApp indexer: {indexed} conversation windows indexed")
@@ -450,12 +593,15 @@ def _is_noreply(addr: str) -> bool:
     return bool(_NOREPLY_RE.search(addr))
 
 
-async def rebuild_contacts() -> int:
-    """Aggregate name → address mappings from indexed mail headers (Phase 4)."""
+# Name precedence when sources disagree: Apple Contacts > Gmail header > nothing.
+_PRIO_CONTACTS, _PRIO_GMAIL, _PRIO_MESSAGE = 3, 2, 1
+
+
+async def _gmail_contact_records() -> list[dict]:
+    """One record per address seen in indexed mail headers (Phase 4 logic)."""
     import json
     from email.utils import getaddresses
 
-    import db
     from search_index import _parse_item_date
 
     conn = await search_index.get_db()
@@ -474,17 +620,143 @@ async def rebuild_contacts() -> int:
             for name, addr in getaddresses([meta.get(field, "") or ""]):
                 if "@" not in addr or _is_noreply(addr):
                     continue
-                entry = agg.setdefault(addr.lower(), {"email": addr.lower(), "name": "",
-                                                      "count": 0, "last_seen": ""})
+                entry = agg.setdefault(addr.lower(), {
+                    "name": "", "emails": [addr.lower()], "phones": [],
+                    "channels": ["gmail"], "count": 0, "last_seen": "", "prio": _PRIO_GMAIL,
+                })
                 entry["count"] += 1
-                if name and len(name) > len(entry["name"]):
-                    entry["name"] = name
+                if name and "@" not in name and len(name) > len(entry["name"]):
+                    entry["name"] = name  # '"addr" <addr>' headers carry no real name
                 if seen > entry["last_seen"]:
                     entry["last_seen"] = seen
+    return list(agg.values())
 
-    await db.replace_contacts(list(agg.values()))
-    logger.debug(f"Contacts rebuilt: {len(agg)} addresses")
-    return len(agg)
+
+async def _message_contact_records() -> list[dict]:
+    """One record per handle seen in indexed iMessage/WhatsApp windows."""
+    import json
+
+    from contacts_module import normalize_handle
+
+    conn = await search_index.get_db()
+    cursor = await conn.execute(
+        "SELECT source, metadata FROM search_index WHERE source IN ('imessage', 'whatsapp')"
+    )
+    rows = await cursor.fetchall()
+
+    agg: dict[tuple[str, str], dict] = {}
+    for r in rows:
+        try:
+            meta = json.loads(r["metadata"])
+        except (json.JSONDecodeError, TypeError):
+            continue
+        handles = list(meta.get("handles") or [])
+        if meta.get("handle"):
+            handles.append(meta["handle"])
+        elif not handles and not meta.get("is_group") and meta.get("contact"):
+            handles.append(meta["contact"])  # pre-resolver windows: contact was the handle
+        seen = meta.get("date", "") or ""
+        weight = int(meta.get("messages") or 1)
+        for raw in handles:
+            key = normalize_handle(raw)
+            if not key:
+                continue
+            entry = agg.setdefault((r["source"], key), {
+                "name": "", "emails": [key] if "@" in key else [],
+                "phones": [key] if "@" not in key else [],
+                "channels": [r["source"]], "count": 0, "last_seen": "", "prio": _PRIO_MESSAGE,
+            })
+            entry["count"] += weight
+            if seen > entry["last_seen"]:
+                entry["last_seen"] = seen
+    return list(agg.values())
+
+
+def _apple_contact_records() -> list[dict]:
+    """Apple Contacts as records (sync; runs in a thread). Empty when unavailable."""
+    try:
+        import contacts_module
+    except ImportError:
+        return []
+    if not contacts_module.is_available():
+        return []
+    resolver = contacts_module.get_resolver()
+    if resolver is None:
+        return []
+    return [{
+        "name": c["name"], "emails": list(c["emails"]), "phones": list(c["phones"]),
+        "channels": ["contacts"], "count": 0, "last_seen": "", "prio": _PRIO_CONTACTS,
+    } for c in resolver.contacts]
+
+
+def merge_contact_records(records: list[dict]) -> list[dict]:
+    """
+    Fold records that share any email or normalized phone into one person:
+    union of emails/phones/channels, summed counts, newest last_seen, and the name
+    from the highest-priority source (longest on a tie). Order of input matters only
+    for ties, so callers pass Apple Contacts first.
+    """
+    people: list[dict] = []
+    index: dict[str, dict] = {}
+
+    def _fold(dst: dict, src: dict) -> None:
+        for field in ("emails", "phones", "channels"):
+            for v in src.get(field, []):
+                if v and v not in dst[field]:
+                    dst[field].append(v)
+        dst["count"] += src.get("count", 0)
+        if (src.get("last_seen") or "") > dst["last_seen"]:
+            dst["last_seen"] = src["last_seen"]
+        name, prio = src.get("name") or "", src.get("prio", 0)
+        if name and (prio, len(name)) > (dst["prio"], len(dst["name"])):
+            dst["name"], dst["prio"] = name, prio
+
+    for rec in records:
+        keys = [k for k in rec.get("emails", []) + rec.get("phones", []) if k]
+        if not keys:
+            continue
+        hits: list[dict] = []
+        for k in keys:
+            p = index.get(k)
+            if p is not None and all(p is not h for h in hits):
+                hits.append(p)
+        if hits:
+            target = hits[0]
+            for other in hits[1:]:  # this record bridges two people → merge them
+                _fold(target, other)
+                people.remove(other)
+                for k, v in list(index.items()):
+                    if v is other:
+                        index[k] = target
+        else:
+            target = {"name": "", "emails": [], "phones": [], "channels": [],
+                      "count": 0, "last_seen": "", "prio": 0}
+            people.append(target)
+        _fold(target, rec)
+        for k in target["emails"] + target["phones"]:
+            index[k] = target
+
+    for p in people:
+        p.pop("prio", None)
+    return people
+
+
+async def rebuild_contacts() -> int:
+    """
+    Rebuild db.contacts as one row per person, merged from Apple Contacts, indexed
+    Gmail headers and indexed iMessage/WhatsApp handles (Phase 4 + Phase 8).
+    """
+    import db
+
+    apple = await asyncio.to_thread(_apple_contact_records)
+    gmail = await _gmail_contact_records()
+    messages = await _message_contact_records()
+
+    people = merge_contact_records(apple + gmail + messages)
+    await db.replace_contacts(people)
+    logger.debug(f"Contacts rebuilt: {len(people)} people "
+                 f"({len(apple)} Apple, {len(gmail)} Gmail addresses, {len(messages)} handles)")
+    return len(people)
 
 
 # ── Orchestration ─────────────────────────────────────────────────

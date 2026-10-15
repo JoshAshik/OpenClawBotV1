@@ -17,11 +17,20 @@ _DB: aiosqlite.Connection | None = None
 
 async def get_db() -> aiosqlite.Connection:
     global _DB
-    if _DB is None:
-        _DB = await aiosqlite.connect(DB_PATH)
-        _DB.row_factory = aiosqlite.Row
-        await _init_search_tables(_DB)
+    if _DB is not None:
+        return _DB
+    import db as _botdb
+    async with _botdb.open_lock(_OPEN_LOCK):
+        if _DB is None:
+            conn = await aiosqlite.connect(DB_PATH)
+            conn.row_factory = aiosqlite.Row
+            await _botdb.apply_pragmas(conn)
+            await _init_search_tables(conn)
+            _DB = conn
     return _DB
+
+
+_OPEN_LOCK: list = []
 
 
 async def _init_search_tables(db: aiosqlite.Connection) -> None:

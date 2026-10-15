@@ -9,3 +9,4 @@ __pycache__/
 *.pyc
 .venv/
 backups/
+evals/last_run.json

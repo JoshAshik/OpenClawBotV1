@@ -89,66 +89,113 @@ the machine); WhatsApp is **read-only**; after messaging, **proactivity** comes 
       - [x] Conversation windows keyed by *chat* (`chat:<id>`, `handle:<id>` for chat-less rows);
         titles use `display_name` for groups and the handle for 1:1 — `resolve_name(handle)` on
         `indexer.build_conversation_windows` is the hook for the Contacts task below.
-- [ ] **Contacts name resolution** (`contacts_module.py`, Mac only): read the Contacts store
-      (`~/Library/Application Support/AddressBook/Sources/*/AddressBook-v22.abcddb`: `ZABCDRECORD`,
-      `ZABCDPHONENUMBER`, `ZABCDEMAILADDRESS`), normalize phones to E.164, map handle → name.
-      Used for window titles ("iMessage with Mike Plumber"), the `contacts` table (merged with
-      Gmail-derived contacts: one row per person with email + phones + channels), and
-      `find_contact` (returns phone and which channel they usually use). Rebuild hourly.
+- [x] **Contacts name resolution** (`contacts_module.py`): reads the root store and every
+      `Sources/*/AddressBook-v22.abcddb` (`ZABCDRECORD`, `ZABCDPHONENUMBER`, `ZABCDEMAILADDRESS`),
+      normalizes phones to E.164 (`CONTACTS_DEFAULT_COUNTRY`), lower-cases emails, folds WhatsApp
+      JIDs, and caches a resolver for an hour. iMessage and WhatsApp windows are titled by name
+      with the raw `handle`/`handles` kept in metadata; `rebuild_contacts` merges Apple Contacts +
+      Gmail headers + indexed message handles into one `contacts` row per person (emails, phones,
+      channels, count, last_seen), and `find_contact` returns phones and channels. Fixture in
+      `tests/fixtures/make_contacts_db.py`, 32 tests. Verified on Windows only; the real store
+      needs Full Disk Access on the Mac (`/doctor` checks it).
 - [ ] **WhatsApp reader hardening:** probe the schema on first run on the real Mac and log the
       exact table/column set; add `ZWAGROUPMEMBER` for group senders, media placeholders, a Z_PK
       cursor, and a clear Telegram warning (once) if the schema doesn't match.
-- [ ] **`send_imessage` tool behind the approval flow:** tool returns an `action` (`to` resolved
-      via contacts to a handle, `body`, `service`); the approval card shows "Name (+1 415…)";
-      `_EDITABLE_FIELDS["send_imessage"] = ("body",)`; `execute_approved_action` runs
-      `osascript` (`tell application "Messages" … send … to participant …`) in a thread with a
-      timeout; shares `RATE_LIMIT_PER_HOUR`. Group-chat sends (by `chat id`) as a follow-up.
-- WhatsApp stays **read-only** by owner decision — no `send_whatsapp` tool; the existing stub in
-  `execute_approved_action` is removed so the model can't be tempted to use it.
-- [ ] **`get_conversation` tool:** live timeline for one contact/chat with `after/before/limit`
-      straight from chat.db / ChatStorage, not just index windows — "what did Mike say last week
-      about the boiler" gets the complete exchange with timestamps.
-- [ ] **Near-realtime indexing:** poll `chat.db-wal` mtime every 30 s (cheap) and index new rows
-      immediately; this is also what Phase 10 alerts hook into.
+- [x] **`send_imessage` tool behind the approval flow:** `agent_tools.resolve_message_recipient`
+      turns a name or handle into one E.164/email handle (ambiguous → asks which, no action);
+      the card shows "Name (+1 415…) via iMessage"; `_EDITABLE_FIELDS["send_imessage"] =
+      ("body",)`; `execute_approved_action` → `imessage_send.send_message` (`osascript` with the
+      body as an argv item, 30 s timeout, Automation-permission hint on -1743) in a thread, audit
+      logged; shares `RATE_LIMIT_PER_HOUR`; on Windows it reports "needs the Mac" and sends
+      nothing. 14 tests. **The live send is unverified until the Mac** (needs Automation →
+      Messages granted once at the display). Group-chat sends (by `chat id`) as a follow-up.
+- [x] WhatsApp stays **read-only** by owner decision — no `send_whatsapp` tool; the stub in
+      `execute_approved_action` is gone and the system prompt says WhatsApp can't be sent to.
+- [x] **`get_conversation` tool:** `imessage_module.get_timeline` reads the newest N messages
+      for a person (their 1:1 chat both ways plus what they sent in groups) or a group chat by
+      display name, with after/before filters, straight from chat.db; senders are named through
+      Contacts; the result carries an `imessage_chat` entity for the working set. Ambiguous
+      names ask back. WhatsApp path uses the read-only reader (unverified until the Mac).
+- [x] **Near-realtime indexing:** `imessage_watch` job every `IMESSAGE_WATCH_SECONDS` (30; 0
+      disables) stats chat.db and chat.db-wal and runs `index_imessage` only when an mtime moved;
+      an `asyncio.Lock` serializes it with the 10-minute indexer, and a change seen while a pass
+      runs is retried next tick. Silent when idle. This is what Phase 10 alerts hook into.
 - **Check:** the Phase 6 check — a WhatsApp/iMessage question ChatGPT structurally cannot answer,
   answered correctly, plus "text Mike that the plumber comes Tuesday" → card → approve → sent.
 
 ## Phase 9 — Engine and reliability   ~2–3 days
 
-- [ ] **Parallel tool execution:** when a round returns several read tools, run them with
-      `asyncio.gather` (results kept in call order); write tools stay sequential.
+- [x] **Parallel tool execution:** `llm._run_tools` runs a round's read tools concurrently
+      under a `MAX_PARALLEL_TOOLS` (4) semaphore, then the `WRITE_TOOLS` (draft/reply/send,
+      remember, reminders) one at a time, and emits results in the original call order so
+      tool_use/tool_results pairing is untouched; a crashing tool becomes a "Tool failed" result.
 - [ ] **Responses API migration** for the agent loop: native for GPT-5.x, reasoning state carries
       across tool rounds (better multi-step tool use), server-side prompt caching. Keep the
       provider-neutral `chat_turns` format; only `_to_openai_messages` and the loop change.
       Expose `OPENAI_REASONING_EFFORT` (default `low` for chat latency) and `OPENAI_FAST_MODEL`
       (`gpt-5-mini`-class) for internal calls: draft revision, digest, image OCR, urgency triage.
-- [ ] **Strict structured outputs** (json_schema) for `revise_draft` and digest/urgency triage.
-- [ ] **Usage and cost:** store `usage` per request (prompt / cached / completion tokens) on
-      `chat_turns`; `/usage` shows today and month-to-date in $ from a price table in `config`.
-      (Cross-cutting item from the old plan, never done.)
-- [ ] **Eval set:** `evals/cases.jsonl` built from real past queries (query → expected
-      source_id / expected tool); `python -m evals` reports hit rate against the live index. Run
-      after each phase.
-- [ ] **Unit tests (pytest, no network):** `telegram_format`, FTS sanitizer, conversation
-      windows, `_to_openai_messages`, the `_EDITABLE_FIELDS` invariant, typedstream decoder, phone
-      normalization. (pytest scaffold, the decoder and window tests landed with Phase 8;
-      `CLAUDE.md` already says `pytest -q`.)
-- [ ] **Robustness:** retry/backoff on OpenAI 429/5xx and Telegram `RetryAfter`; a per-turn
-      timeout; a concurrency guard (second message while a turn runs → "still working on the
-      last one" or queue); SQLite WAL mode + `busy_timeout` for `clawdbot.db` under indexer load.
+- [x] **Strict structured outputs:** `llm.revise_draft` sends a strict `json_schema` built from
+      `_EDITABLE_FIELDS` (`llm.schema_for`), so a reply/text revision cannot even return a
+      recipient; falls back to `json_object` if the API rejects the schema. Urgency triage was
+      already strict (`alerts._SCHEMA`); the digest stays free text by design.
+- [x] **Usage and cost:** every OpenAI call records to `llm_usage` via `llm.record_usage`
+      (streaming agent rounds use `stream_options.include_usage`; embeddings, voice, vision,
+      revise, digest, triage, follow-ups all covered); agent turns also store
+      prompt/completion tokens and cost on `chat_turns` (guarded ALTER migration). Prices live
+      in `config.PRICES_PER_MTOK` (placeholders — **update from OpenAI's pricing page**; unknown
+      models are flagged). `/usage` shows today and month-to-date by purpose and model plus the
+      five most expensive turns; `/status` shows today's spend. 9 tests.
+- [x] **Eval set:** `evals/extract.py` mines `chat_turns` read-only into `evals/cases.jsonl`
+      (query → expected source_id, only turns that opened with a search/read; emails, phones
+      and key-like tokens redacted; `manual` cases preserved); `python -m evals.run` scores
+      hit@1 / hit@5 / MRR against the live index and `--live` drives the real agent on a few
+      cases reporting cost. **Baseline 2026-10-15 (commit 7032c05 + working tree), offline,
+      3 mined cases: hit@1 33%, hit@5 67%, MRR 0.40.** Hits: "most recent email about rent /
+      invoice" (rank 5), "who sent the tuition invoice" (rank 1). Miss: "receipts from AI
+      companies" — the agent only found it by rewriting the query with vendor names, so plain
+      hybrid search doesn't surface it; a candidate for query expansion. Only 7 real turns
+      exist yet — add manual cases (see evals/README.md) before treating the number as a trend.
+- [x] **Unit tests (pytest, no network):** 175 across `tests/`: `telegram_format` (inline,
+      blocks, escaping, malformed input), the FTS5 sanitizer (quoted MATCH accepted by a real
+      FTS5 table, LIKE fallback on syntax error), `_to_openai_messages`, the token-budgeted
+      history (whole turns only, tool_use/tool_results never split), the `_EDITABLE_FIELDS`
+      lock, the typedstream decoder, phone normalization, windows, reminders, alerts, digest,
+      engine, robustness, evals. `CLAUDE.md` says how to run them.
+- [x] **Robustness:** `llm.with_retry` (0.5/1/2/4 s backoff, Retry-After honoured, 429/5xx/
+      connection/timeout only) wraps every OpenAI call incl. the agent stream, embeddings and
+      triage; both OpenAI clients get `OPENAI_TIMEOUT_SECONDS` and SDK retries off. A turn is
+      bounded by `TURN_TIMEOUT_SECONDS` (friendly error + Retry) and a per-user lock
+      serializes turns ("Still working on your last message…"). `telegram_format.tg_retry`
+      handles flood control (RetryAfter) and "not modified" on status edits, approval cards
+      and every job send. Both SQLite connections run `journal_mode=WAL`, `busy_timeout=5000`,
+      `synchronous=NORMAL`; backups verified while another connection holds a write lock.
+      12 tests.
 - **Check:** eval hit rate ≥ 9/10; `/usage` matches the OpenAI dashboard within a few percent.
 
 ## Phase 10 — Proactivity   ~2–3 days
 
-- [ ] **Reminders tool:** `set_reminder(when_iso, text)` → `reminders` table → job queue fires a
-      Telegram message with Snooze 1h / Tomorrow / Done buttons; `/reminders` lists; model
-      resolves "Friday 9am" against the prompt's current time.
-- [ ] **Waiting-on tracker:** sent emails (and sent iMessages) with no reply after N days
-      surface in the digest with a "Nudge" button that drafts a follow-up (approval card).
-- [ ] **Urgent alerts:** incremental inbound sync every 2–3 min; the fast model classifies new
-      inbound (email, iMessage, WhatsApp) as urgent (emergency repair, payment failure, legal,
-      move-out) vs. routine; urgent → immediate alert with a Reply button; routine waits for the
-      digest. Watch-list of contacts/keywords in memory ("always alert me about Unit 4").
+- [x] **Reminders tool:** `set_reminder(when, text)` / `list_reminders` / `cancel_reminder`
+      (direct-execute: a reminder only messages the owner, so no approval card); `reminders`
+      table (UTC `due_at`, `fired_at` guards against refiring, `snoozed_from`); the `reminders`
+      job fires due ones every minute as "⏰ Reminder: …" with Snooze 1h / Tomorrow
+      (`REMINDER_HOUR`, default 09:00) / Done buttons; `/reminders` lists; the system prompt
+      makes the model pass an absolute local time. 16 tests.
+- [x] **Waiting-on tracker:** `waiting_on.list_waiting` finds, from the index alone, Gmail
+      threads whose newest message is mine (to a real person, not noreply) and 1:1 iMessage
+      windows ending with "Me:", both older than `WAITING_ON_DAYS` (3). Surfaces in the digest
+      (section + up to 5 cards) and `/waiting`, with ✍️ Nudge (LLM-drafted follow-up presented
+      as a reply_email / send_imessage approval card — never sent directly) and 🙈 Dismiss
+      (`waiting_on_dismissed`). `list_waiting_on` tool for the model. 9 tests.
+- [x] **Urgent alerts:** `indexer.new_items` queues every freshly indexed email / message window
+      (≤ `ALERT_MAX_AGE_HOURS` old, so backfills never alert); the `alerts` job every
+      `ALERT_POLL_MINUTES` (3) runs a light inbound sync (Gmail `newer_than:1d`, iMessage) and
+      `alerts.process`: inbound only, deduped via `alerts_sent`, watch-list hits (memories saved
+      as "ALERT: …") urgent outright, the rest triaged by `OPENAI_FAST_MODEL` with a strict JSON
+      schema (emergency / payment / legal / moveout / routine). Pushed as 🚨 cards with ✍️ Reply
+      (acknowledgement drafted → reply_email / send_imessage approval card) and 👀 Seen; held
+      during `ALERT_QUIET_HOURS` (23-7) and flushed by the next poll or the digest. `/alerts
+      [on|off]`. 13 tests. **Live classification quality is unverified** — tune the triage
+      prompt once real mail flows on the Mac.
 - [ ] **Apple Calendar** (`calendar_module.py`, Mac only, via `pyobjc-framework-EventKit`):
       request full calendar access once (TCC prompt at the display), then `list_events(after,
       before, calendar?)` reads every iCloud/local calendar, and `create_event(title, start, end,
@@ -157,8 +204,13 @@ the machine); WhatsApp is **read-only**; after messaging, **proactivity** comes 
       with today's schedule; "when am I free Thursday afternoon?" answered from events. Inert on
       Windows like the other Mac modules. AppleScript (`tell application "Calendar"`) as the
       fallback if EventKit access is refused.
-- [ ] **Digest 2.0:** today's calendar, waiting-on, reminders due, open tickets, new reviews,
-      unread that matters; optional short evening wrap-up.
+- [x] **Digest 2.0:** `digest.py` gathers each section in isolation (one failure never kills the
+      briefing): today's calendar (optional `calendar_module.list_events` hook — **fills in once
+      the Mac EventKit module exists**), reminders due/overdue, urgent alerts (held + last 24h),
+      waiting-on, unread per account with inbox counts, new reviews, pending cards; composed by
+      the fast model, then waiting-on cards, then held alerts flushed. Optional evening wrap-up
+      at `EVENING_DIGEST_HOUR` (waiting-on, due tomorrow, alerts since morning, pending);
+      `/digest [evening]` previews on demand. 8 tests.
 - **Check:** "remind me Thursday to chase the deposit" fires on Thursday; an urgent tenant text
   reaches Telegram within 3 minutes.
 

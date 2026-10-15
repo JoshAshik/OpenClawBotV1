@@ -7,10 +7,14 @@ Guidance for AI-assisted work on Clawdbot — a single-user Telegram assistant b
 
 - `python main.py` — long-running polling bot; needs a filled `.env`. Use the venv:
   `.venv\Scripts\python.exe`.
-- Tests: `pip install -r requirements-dev.txt` once, then `pytest -q` (no network; the iMessage
+- Tests: `pip install -r requirements-dev.txt` once, then `pytest -q` (no network; the iMessage/Contacts
   tests build a synthetic `chat.db` from `tests/fixtures/make_chat_db.py` and point the reader at
   it with `IMESSAGE_DB_PATH`, and index tests use a temp bot DB with embeddings stubbed). Also run
   `python -m py_compile <files>` and the import/build check: `python -c "import bot; bot.build_app()"`.
+- Evals: `python -X utf8 -m evals.run` scores retrieval (hit@1/5, MRR) for the cases in
+  `evals/cases.jsonl` against the live index (a few cents of embeddings); `--live` also drives the
+  real agent on a handful of cases and reports the cost. Re-run after search/index/prompt changes;
+  `python -m evals.extract` re-mines cases from real conversations (read-only, manual cases kept).
 - End-to-end checks call `llm.agent_chat(...)` directly (no Telegram needed) — this hits the real
   OpenAI API and the user's real `clawdbot.db`; keep such tests small and cheap.
 - Dev box is Windows (Git Bash shell; beware cp1252 console output — pass `-X utf8` to Python).
@@ -19,15 +23,20 @@ Guidance for AI-assisted work on Clawdbot — a single-user Telegram assistant b
 
 - **OpenAI-only, by owner decision.** Never add Anthropic/Claude SDK calls or a model switcher.
   Models come from `config.OPENAI_MODEL` / `EMBEDDING_MODEL` / `VOICE_MODEL`.
-- **Approval-flow invariant:** anything outbound (send/reply email, future iMessage/WhatsApp sends)
-  must be returned from `agent_tools.execute_tool` as a pending `action`, surfaced as an
+- **Approval-flow invariant:** anything outbound (send/reply email, `send_imessage`) must be
+  returned from `agent_tools.execute_tool` as a pending `action`, surfaced as an
   Approve / ✏️ Edit / ❌ Reject card, and executed only in `bot.execute_approved_action`.
-  Tools never send directly, and the model must never claim an email was sent.
+  Tools never send directly, and the model must never claim an email or text was sent.
+  iMessage sends go through `imessage_send.send_message` (osascript, body passed as argv, Mac
+  only — needs Automation → Messages granted once). **WhatsApp is read-only by owner decision:**
+  never add a `send_whatsapp` tool or action.
 - The draft **Edit loop may not change a reply's recipient or thread** — editable fields per action
   type are locked in `llm._EDITABLE_FIELDS`.
 - All sync google-api / OneDrive calls must run through `asyncio.to_thread` — the bot, the
   background indexer, and the job queue share one event loop.
-- The single authorized user is enforced by `security.auth_required`; keep it on every handler.
+- Authorization is enforced by `security.auth_required` (keep it on every handler) against
+  `config.TELEGRAM_AUTHORIZED_USER_IDS` — a comma-separated list in `.env`. The first id is the
+  owner (`config.TELEGRAM_AUTHORIZED_USER_ID`): every proactive push targets that id only.
 
 ## Architecture (follow a message through)
 
@@ -51,6 +60,44 @@ Guidance for AI-assisted work on Clawdbot — a single-user Telegram assistant b
    the bot — see `deploy/`). Background jobs record `last_index_at` / `last_backfill_at` /
    `last_backup_at` in `settings`. These are not outbound actions and bypass the approval flow,
    but every command is still `auth_required` with a confirm button.
+7. **contacts_module.py** — Apple Contacts reader (Mac only; `CONTACTS_DB_PATH` points it at a
+   fixture on Windows). Normalizes phones/emails/WhatsApp JIDs with `normalize_handle`, caches a
+   `ContactResolver` for an hour, and hands `resolve` to the indexer as `resolve_name` so message
+   windows are titled by person. `indexer.rebuild_contacts` merges Apple Contacts + Gmail headers +
+   indexed message handles into one `contacts` row per person (emails, phones, channels JSON).
+8. **Message tools** — `get_conversation` (agent_tools) reads a live timeline via
+   `imessage_module.get_timeline`, not the index; `indexer.watch_imessage_once` is the 30 s
+   chat.db-mtime watcher behind the `imessage_watch` job, serialized with the main indexer by
+   `indexer._imessage_lock` (always call `index_imessage`, never `_index_imessage_unlocked`).
+9. **reminders.py** — `set_reminder` / `/reminders` / the minutely `reminders` job. Reminders are
+   **not outbound** (they only message the owner), so by design they execute directly and skip
+   the approval flow; buttons use callback prefix `rem_`. Times are UTC in the DB, local in text.
+10. **waiting_on.py** — "sent by me, no reply" detection from the index (Gmail threads + 1:1
+    iMessage windows), dismissals in `waiting_on_dismissed`, and `build_nudge_action`, which
+    returns a pending reply_email / send_imessage action for `bot.request_approval` — the Nudge
+    button is just another way to open an approval card. `agent_tools.build_reply_action` /
+    `build_imessage_action` are the shared payload builders; use them for any new follow-up path.
+11. **alerts.py** — urgent inbound triage. `indexer.note_new_item` feeds `indexer.new_items`;
+    the `alerts` job drains it, filters to inbound, dedupes with `alerts_sent`, applies the
+    watch-list (memories beginning "ALERT:" / "always alert" — the system prompt tells the
+    model to store them that way) and asks `config.OPENAI_FAST_MODEL` (strict JSON schema) for
+    the rest. ✍️ Reply builds a pending action via the shared builders — approval card as usual.
+    Quiet hours hold alerts in `alerts.held`; the digest force-flushes them.
+12. **digest.py** — morning briefing / evening wrap-up: `build_sections(kind)` runs each source
+    through `_safe` so a dead Gmail token or missing calendar only drops that section;
+    `run()` composes with the fast model (`llm.compose_digest(raw, kind)`), sends, then the
+    waiting-on cards, then `alerts.flush_held(force=True)`. Calendar is an optional import of
+    `calendar_module` with `is_available()` / `list_events(after_iso, before_iso)`.
+13. **Engine notes** — `llm._run_tools` runs read tools in parallel (semaphore
+    `MAX_PARALLEL_TOOLS`) and `WRITE_TOOLS` sequentially, preserving call order; add any new
+    state-changing tool to `llm.WRITE_TOOLS`. Every OpenAI call must go through
+    `llm.record_usage(purpose, model, response.usage)` (streaming: pass
+    `stream_options={"include_usage": True}` and read the final chunk's `usage`); costs come from
+    `config.PRICES_PER_MTOK`, which the owner keeps in sync with OpenAI pricing.
+14. **Resilience rules** — every OpenAI call goes through `llm.with_retry(lambda: ..., purpose)`;
+    every Telegram send/edit outside a handler's direct reply goes through
+    `telegram_format.tg_retry`; agent turns run under `bot._TURN_LOCKS[user]` with
+    `TURN_TIMEOUT_SECONDS`; the DB is WAL (`db.apply_pragmas`) — never set journal_mode elsewhere.
 
 ## Conversation storage
 
@@ -71,5 +118,7 @@ tool_use from its tool_results.
 - `imessage_module` decodes `message.attributedBody` (typedstream) because `message.text` is
   usually NULL on current macOS; the indexer keeps a ROWID cursor in `settings.imessage_last_rowid`
   and keys conversation windows by chat (`chat:<id>` / `handle:<id>`), so group threads stay together.
+- The `contacts` table is derived data: `db._migrate_contacts` drops and recreates it when the schema
+  changes, and every index cycle rebuilds it, so never store hand-entered data there.
 - `clawdbot.db`, `token_*.json`, `credentials.json`, `.env`, `clawdbot.log` are live user data in
   the repo directory — don't commit, truncate, or overwrite them.

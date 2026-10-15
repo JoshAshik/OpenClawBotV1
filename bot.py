@@ -20,7 +20,7 @@ from datetime import datetime, time as dtime, timezone
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
-from telegram.error import BadRequest
+from telegram.error import BadRequest, RetryAfter
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -31,17 +31,21 @@ from telegram.ext import (
 )
 
 import agent_tools
+import alerts
 import config
 import db
+import digest
 import gmail_module
 import indexer
 import llm
 import ops
+import reminders
 import reviews
+import waiting_on
 import search_index
 import security
 from security import ActionCategory, auth_required
-from telegram_format import markdown_to_telegram_html
+from telegram_format import markdown_to_telegram_html, tg_retry
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +67,13 @@ _TOOL_LABELS = {
     "read_onedrive_file": "📁 Reading a OneDrive file",
     "read_indexed_document": "📖 Reading a document",
     "get_index_stats": "📊 Checking the index",
+    "find_contact": "👤 Looking up a contact",
+    "send_imessage": "💬 Drafting a text message",
+    "get_conversation": "💬 Pulling up the conversation",
+    "list_waiting_on": "⏳ Checking what's unanswered",
+    "set_reminder": "⏰ Setting a reminder",
+    "list_reminders": "⏰ Checking reminders",
+    "cancel_reminder": "⏰ Cancelling a reminder",
     "remember": "💾 Saving to memory",
 }
 
@@ -73,6 +84,16 @@ def _tool_label(name: str, args: dict) -> str:
     if query:
         label += f': "{str(query)[:60]}"'
     return label
+
+
+class TurnTimeout(Exception):
+    """An agent turn exceeded TURN_TIMEOUT_SECONDS and was cancelled."""
+
+
+# One lock per user: a second message while a turn runs waits its turn instead of
+# running concurrently (and the user is told so).
+_TURN_LOCKS: dict[int, asyncio.Lock] = {}
+BUSY_TEXT = "⏳ Still working on your last message — I'll take this one next."
 
 
 class StatusMessage:
@@ -98,7 +119,8 @@ class StatusMessage:
             await self._bot.send_chat_action(chat_id=self._chat_id, action=ChatAction.TYPING)
         except Exception:
             pass
-        self._message = await self._bot.send_message(chat_id=self._chat_id, text="🤔 Thinking…")
+        self._message = await tg_retry(
+            lambda: self._bot.send_message(chat_id=self._chat_id, text="🤔 Thinking…"))
 
     # -- callbacks invoked by llm.py --
 
@@ -138,22 +160,22 @@ class StatusMessage:
         self._last_edit = now
         self._last_rendered = text
         try:
-            await self._message.edit_text(text)
+            await tg_retry(lambda: self._message.edit_text(text))
         except BadRequest:
-            pass  # "message is not modified" and similar — harmless
+            pass  # a different BadRequest (e.g. too long) — harmless for a progress edit
         except Exception:
             logger.debug("status edit failed", exc_info=True)
 
     async def _edit_final(self, chunk: str) -> None:
         """Edit the status message into the final answer, HTML first, plain fallback."""
         try:
-            await self._message.edit_text(
+            await tg_retry(lambda: self._message.edit_text(
                 markdown_to_telegram_html(chunk), parse_mode="HTML",
                 disable_web_page_preview=True,
-            )
+            ))
         except BadRequest:
             try:
-                await self._message.edit_text(chunk)
+                await tg_retry(lambda: self._message.edit_text(chunk))
             except BadRequest:
                 pass
 
@@ -165,12 +187,12 @@ class StatusMessage:
         await self._edit_final(chunks[0])
         for chunk in chunks[1:]:
             try:
-                await self._bot.send_message(
+                await tg_retry(lambda: self._bot.send_message(
                     chat_id=self._chat_id, text=markdown_to_telegram_html(chunk),
                     parse_mode="HTML", disable_web_page_preview=True,
-                )
+                ))
             except BadRequest:
-                await self._bot.send_message(chat_id=self._chat_id, text=chunk)
+                await tg_retry(lambda: self._bot.send_message(chat_id=self._chat_id, text=chunk))
 
     async def fail(self, error: Exception, retry_key: str) -> None:
         if self._message is None:
@@ -178,9 +200,13 @@ class StatusMessage:
         buttons = InlineKeyboardMarkup(
             [[InlineKeyboardButton("🔄 Retry", callback_data=f"retry:{retry_key}")]]
         )
-        msg = f"Something went wrong ({type(error).__name__}). Nothing was sent."
+        if isinstance(error, TurnTimeout):
+            msg = (f"That took too long (over {int(config.TURN_TIMEOUT_SECONDS)}s) and was stopped. "
+                   "Nothing was sent.")
+        else:
+            msg = f"Something went wrong ({type(error).__name__}). Nothing was sent."
         try:
-            await self._message.edit_text(msg, reply_markup=buttons)
+            await tg_retry(lambda: self._message.edit_text(msg, reply_markup=buttons))
         except Exception:
             logger.debug("error render failed", exc_info=True)
 
@@ -198,6 +224,8 @@ def _action_summary(action_type: str, payload: dict) -> str:
         return f"Reply to {payload.get('to', '?')}"
     if action_type == "send_email":
         return f"Email to {payload.get('to', '?')}"
+    if action_type == "send_imessage":
+        return f"Text to {payload.get('to_name') or payload.get('to', '?')}"
     return action_type
 
 
@@ -247,7 +275,20 @@ async def _handle_draft_edit(context: ContextTypes.DEFAULT_TYPE, user_id: int, i
 
 
 async def _run_agent_turn(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int, user_text: str) -> None:
-    """Shared free-text pipeline: status message → agent → final render → approvals."""
+    """Shared free-text pipeline, one turn at a time per user (see _TURN_LOCKS)."""
+    lock = _TURN_LOCKS.setdefault(user_id, asyncio.Lock())
+    if lock.locked():
+        try:
+            await tg_retry(lambda: context.bot.send_message(chat_id, BUSY_TEXT))
+        except Exception:
+            pass
+    async with lock:
+        await _run_agent_turn_locked(context, chat_id, user_id, user_text)
+
+
+async def _run_agent_turn_locked(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int,
+                                 user_text: str) -> None:
+    """status message → agent (bounded by TURN_TIMEOUT_SECONDS) → final render → approvals."""
     await db.log_audit("chat", "read", f"User message ({len(user_text)} chars)",
                        user_id=user_id, approved=True)
 
@@ -255,7 +296,14 @@ async def _run_agent_turn(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user
     await status.start()
 
     try:
-        result = await llm.agent_chat(user_text, progress=status)
+        result = await asyncio.wait_for(
+            llm.agent_chat(user_text, progress=status), timeout=config.TURN_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        logger.warning(f"Agent turn timed out after {config.TURN_TIMEOUT_SECONDS}s")
+        key = uuid.uuid4().hex[:12]
+        _RETRY_CACHE[key] = user_text
+        await status.fail(TurnTimeout(), key)
+        return
     except Exception as e:
         logger.exception("LLM agent call failed")
         key = uuid.uuid4().hex[:12]
@@ -317,6 +365,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "*Conversation*\n"
         "/new — Start a fresh conversation\n"
         "/memories — Show long-term memories\n"
+        "/reminders — Pending reminders (\"remind me Friday to…\" sets one)\n"
+        "/waiting — Sent emails/texts with no reply, with Nudge buttons\n"
+        "/alerts [on|off] — Urgent inbound alerts status, watch-list, last alerts\n"
         "/forget `<id>` — Delete a memory\n"
         "/cancel — Cancel an in-progress draft edit\n\n"
         "*Email*\n"
@@ -332,6 +383,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/pin `<code>` — Unlock session\n"
         "/lock — Lock session\n"
         "/status — Current state\n"
+        "/usage — OpenAI spend today / month, by purpose and model\n"
         "/doctor — Health checks (tokens, OpenAI, data sources, jobs)\n"
         "/update — Pull the latest code and restart\n"
         "/restart — Restart the bot\n"
@@ -382,9 +434,15 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     last_backfill = ops.fmt_ts(await db.get_setting(ops.LAST_BACKFILL_KEY))
     last_backup = ops.fmt_ts(await db.get_setting(ops.LAST_BACKUP_KEY))
     started = ops.STARTED_AT.astimezone().strftime("%Y-%m-%d %H:%M")
+    try:
+        today = await db.usage_summary(ops.day_start_iso())
+        spend = f"${today['cost']:.2f} ({today['calls']} calls)"
+    except Exception:
+        spend = "n/a"
     await update.message.reply_text(
         f"*Clawdbot Status*\n\n"
-        f"Model: `{config.OPENAI_MODEL}`\n"
+        f"Model: `{config.OPENAI_MODEL}` (fast: `{config.OPENAI_FAST_MODEL}`)\n"
+        f"Spend today: {spend} — /usage for the breakdown\n"
         f"Uptime: {ops.uptime_str()} (since {started})\n"
         f"Session: {'unlocked' if security.is_session_unlocked() else 'LOCKED'}\n"
         f"Outbound this hour: {used}/{config.RATE_LIMIT_PER_HOUR}\n"
@@ -395,6 +453,14 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"/doctor for full health checks",
         parse_mode="Markdown",
     )
+
+
+@auth_required
+async def cmd_usage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    today = await db.usage_summary(ops.day_start_iso())
+    month = await db.usage_summary(ops.month_start_iso())
+    top = await db.top_turns(ops.month_start_iso(), limit=5)
+    await update.message.reply_text(ops.format_usage(today, month, top)[:TELEGRAM_MAX_LEN])
 
 
 # ── Ops: doctor / update / restart ───────────────────────────────
@@ -1375,6 +1441,218 @@ async def _background_backfill(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.error(f"Backfill failed: {e}")
 
 
+async def _reminders_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Every minute: send due reminders to the owner (see reminders.fire_due)."""
+    try:
+        await reminders.fire_due(context.bot)
+    except Exception as e:
+        logger.error(f"Reminder job failed: {e}")
+
+
+async def handle_reminder_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Snooze 1h / Tomorrow / Done buttons on a fired reminder."""
+    query = update.callback_query
+    await query.answer()
+    if not security.is_authorized(query.from_user.id):
+        await query.edit_message_text("Unauthorized.")
+        return
+    kind, _, rid_str = query.data.removeprefix(reminders.CB_PREFIX).partition(":")
+    try:
+        rid = int(rid_str)
+    except ValueError:
+        return
+    text = await reminders.apply_button(kind, rid)
+    try:
+        await query.edit_message_text(text)
+    except BadRequest:
+        pass
+
+
+@auth_required
+async def cmd_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    pending = await db.list_reminders("pending", limit=30)
+    if not pending:
+        await update.message.reply_text(
+            "No pending reminders. Say something like \"remind me Friday at 9 to chase the deposit\"."
+        )
+        return
+    lines = ["⏰ Pending reminders\n"] + [reminders.describe(r) for r in pending]
+    lines.append("\nCancel one by telling me, e.g. \"cancel reminder 3\".")
+    await update.message.reply_text("\n".join(lines))
+
+
+ALERTS_SETTING = "alerts_enabled"
+
+
+async def alerts_enabled() -> bool:
+    raw = await db.get_setting(ALERTS_SETTING)
+    if raw is None:
+        return config.ALERTS_ENABLED
+    return raw == "1"
+
+
+async def _alerts_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Every ALERT_POLL_MINUTES: light inbound sync, then triage whatever is new."""
+    if not await alerts_enabled():
+        indexer.drain_new_items()
+        return
+    try:
+        for a in await llm._get_accounts_cached():
+            try:
+                await indexer.index_gmail(max_emails=50, account=a["label"], query="newer_than:1d")
+            except Exception as e:
+                logger.debug(f"alerts: gmail sync skipped for {a['label']}: {e}")
+        await indexer.index_imessage()
+        await alerts.process(context.bot, indexer.drain_new_items())
+    except Exception as e:
+        logger.error(f"Alerts job failed: {e}")
+
+
+async def alert_reply(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int, token: str) -> str:
+    """Draft an acknowledgement and present it as an approval card. Never sends."""
+    try:
+        action = await alerts.build_reply_action(token)
+    except Exception as e:
+        return f"Couldn't draft a reply: {e}"
+    await request_approval(
+        context, chat_id, user_id,
+        action_type=action["type"], category=ActionCategory.WRITE,
+        summary=action["summary"], payload=action["payload"],
+    )
+    return "✍️ Reply drafted — approve it on the card below."
+
+
+async def handle_alert_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """✍️ Reply / 👀 Seen buttons on an urgent alert."""
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    if not security.is_authorized(user.id):
+        await query.edit_message_text("Unauthorized.")
+        return
+    op, _, token = query.data.removeprefix(alerts.CB_PREFIX).partition(":")
+    original = query.message.text or ""
+    if op == "seen":
+        try:
+            await query.edit_message_text(original + "\n\n👀 Seen.")
+        except BadRequest:
+            pass
+        return
+    if op == "reply":
+        text = await alert_reply(context, query.message.chat_id, user.id, token)
+        try:
+            await query.edit_message_text(original + f"\n\n{text}")
+        except BadRequest:
+            pass
+
+
+@auth_required
+async def cmd_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/alerts [on|off] — toggle urgent alerts and show the last few."""
+    arg = (context.args[0].lower() if context.args else "")
+    if arg in ("on", "off"):
+        await db.set_setting(ALERTS_SETTING, "1" if arg == "on" else "0")
+        await db.log_audit("alerts_toggle", "config", f"Urgent alerts turned {arg}",
+                           user_id=update.effective_user.id, approved=True)
+    enabled = await alerts_enabled()
+    quiet = config.ALERT_QUIET_HOURS or "none"
+    terms = await alerts.watch_terms()
+    lines = [
+        f"🚨 Urgent alerts: {'ON' if enabled else 'OFF'} (every {config.ALERT_POLL_MINUTES} min, "
+        f"quiet hours {quiet}, model {config.OPENAI_FAST_MODEL})",
+        "Watch-list: " + (", ".join(terms) if terms else "none — say \"always alert me about …\""),
+        "Toggle with /alerts on or /alerts off.",
+    ]
+    recent = await db.recent_alerts(limit=5)
+    if recent:
+        lines.append("\nLast alerts:")
+        for r in recent:
+            lines.append(f"- {r['sent_at'][:16].replace('T', ' ')} {r['category']}: {r['title'][:60]}")
+    if alerts.held:
+        lines.append(f"\n{len(alerts.held)} urgent item(s) held for quiet hours.")
+    await update.message.reply_text("\n".join(lines))
+
+
+def _waiting_buttons(item: dict) -> InlineKeyboardMarkup:
+    tok = item["token"]
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✍️ Nudge", callback_data=f"wait_nudge:{tok}"),
+        InlineKeyboardButton("🙈 Dismiss", callback_data=f"wait_dismiss:{tok}"),
+    ]])
+
+
+async def _send_waiting_cards(bot, chat_id: int, items: list[dict], limit: int = 5) -> int:
+    sent = 0
+    for it in items[:limit]:
+        try:
+            await tg_retry(lambda: bot.send_message(chat_id, waiting_on.describe(it), reply_markup=_waiting_buttons(it)))
+            sent += 1
+        except Exception as e:
+            logger.warning(f"waiting-on card failed: {e}")
+    return sent
+
+
+async def nudge_item(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int, item: dict) -> str:
+    """Draft the follow-up and present it as a normal approval card. Never sends."""
+    try:
+        action = await waiting_on.build_nudge_action(item)
+    except Exception as e:
+        logger.warning(f"nudge draft failed: {e}")
+        return f"Couldn't draft the follow-up: {e}"
+    await request_approval(
+        context, chat_id, user_id,
+        action_type=action["type"], category=ActionCategory.WRITE,
+        summary=action["summary"], payload=action["payload"],
+    )
+    return f"✍️ Follow-up drafted for {waiting_on.describe(item)} — approve it on the card below."
+
+
+async def handle_waiting_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Nudge / Dismiss buttons on a waiting-on item."""
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    if not security.is_authorized(user.id):
+        await query.edit_message_text("Unauthorized.")
+        return
+    op, _, tok = query.data.removeprefix("wait_").partition(":")
+    item = await waiting_on.find_by_token(tok)
+    if item is None:
+        await query.edit_message_text("That item is no longer waiting (replied, dismissed, or re-indexed).")
+        return
+    if op == "dismiss":
+        await db.dismiss_waiting(item["kind"], item["key"])
+        await query.edit_message_text(f"🙈 Dismissed: {waiting_on.describe(item)}")
+        return
+    if op == "nudge":
+        text = await nudge_item(context, query.message.chat_id, user.id, item)
+        try:
+            await query.edit_message_text(text)
+        except BadRequest:
+            pass
+
+
+@auth_required
+async def cmd_waiting(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    items = await waiting_on.list_waiting()
+    if not items:
+        await update.message.reply_text(waiting_on.format_waiting(items))
+        return
+    await update.message.reply_text(
+        f"⏳ Waiting on a reply ({len(items)}, no answer after {config.WAITING_ON_DAYS}+ days). "
+        "Nudge drafts a follow-up for your approval; Dismiss hides it."
+    )
+    await _send_waiting_cards(context.bot, update.effective_chat.id, items, limit=10)
+
+
+async def _imessage_watch(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Every IMESSAGE_WATCH_SECONDS: index new iMessage rows as soon as chat.db changes."""
+    try:
+        await indexer.watch_imessage_once()
+    except Exception as e:
+        logger.error(f"iMessage watch failed: {e}")
+
+
 async def _background_backup(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Nightly SQLite online backup of clawdbot.db (see ops.backup_database)."""
     try:
@@ -1655,17 +1933,17 @@ async def request_approval(
 
     preview = _card_text(summary, action_type, payload)
     try:
-        await context.bot.send_message(
+        await tg_retry(lambda: context.bot.send_message(
             chat_id=chat_id,
             text=preview,
             parse_mode="Markdown",
             reply_markup=_approval_buttons(action_id),
-        )
+        ))
     except BadRequest:
         # Draft content broke Markdown parsing — send plain.
-        await context.bot.send_message(
+        await tg_retry(lambda: context.bot.send_message(
             chat_id=chat_id, text=preview, reply_markup=_approval_buttons(action_id)
-        )
+        ))
 
 
 async def handle_approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1824,9 +2102,25 @@ async def execute_approved_action(action: dict) -> str:
         except Exception as e:
             return f"Reply failed: {e}"
     elif action_type == "send_imessage":
-        return "iMessage sending not yet implemented (Phase 6 of the plan)."
-    elif action_type == "send_whatsapp":
-        return "WhatsApp sending not yet implemented (Phase 6 of the plan)."
+        import imessage_send
+        label = agent_tools.message_recipient_label(payload)
+        service = imessage_send.normalize_service(payload.get("service"))
+        if not imessage_send.is_available():
+            await db.log_audit("send_imessage", "write",
+                               f"Not sent to {label}: iMessage sending needs the Mac", approved=False)
+            return (f"iMessage sending needs the Mac (Messages.app). Nothing was sent to {label}; "
+                    "approve again once Clawdbot runs on the Mac mini.")
+        try:
+            await asyncio.to_thread(
+                imessage_send.send_message, payload["to"], payload["body"], service
+            )
+            await db.log_audit("send_imessage", "write", f"{service} sent to {label}",
+                               detail=payload.get("body", "")[:500], approved=True)
+            return f"{service} sent to {label}."
+        except Exception as e:
+            await db.log_audit("send_imessage", "write", f"{service} to {label} failed: {e}",
+                               approved=False)
+            return f"{service} send failed: {e}"
     else:
         return f"Unknown action type: {action_type}"
 
@@ -2058,63 +2352,28 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # ── Morning Digest (Phase 5) ─────────────────────────────────────
 
 async def _daily_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Push a short triaged briefing: unread that matters, reviews, pending drafts."""
-    sections = []
-
-    for a in await llm._get_accounts_cached():
-        try:
-            unread = await asyncio.to_thread(
-                gmail_module.list_emails, max_results=15,
-                query="is:unread newer_than:1d", account=a["label"],
-            )
-            if unread:
-                lines = [f"- {e['from'][:45]}: {e['subject'][:70]}" for e in unread]
-                sections.append(f"UNREAD ({a['label']}, last 24h):\n" + "\n".join(lines))
-        except Exception:
-            sections.append(
-                f"UNREAD ({a['label']}): unavailable — Gmail needs reconnecting (/addaccount {a['label']})"
-            )
-
+    """Morning briefing (see digest.py): sections → fast-model summary → cards → held alerts."""
     try:
-        cutoff = time.time() - 86400
-        recent = [r for r in await db.get_recent_reviews(limit=20) if (r.get("time") or 0) > cutoff]
-        if recent:
-            lines = [f"- {r['rating']}★ by {r['author']}: {(r['text'] or '')[:100]}" for r in recent]
-            sections.append("NEW REVIEWS (24h):\n" + "\n".join(lines))
-    except Exception:
-        pass
-
-    conn = await db.get_db()
-    cursor = await conn.execute(
-        "SELECT id, action_type, payload FROM pending_actions WHERE status = 'pending' ORDER BY id DESC LIMIT 5"
-    )
-    rows = await cursor.fetchall()
-    if rows:
-        lines = []
-        for r in rows:
-            p = json.loads(r["payload"])
-            lines.append(f"- {r['action_type']} to {p.get('to', '?')}: {p.get('subject', '')[:60]}")
-        sections.append("PENDING DRAFTS (still awaiting your Approve/Reject):\n" + "\n".join(lines))
-
-    if not sections:
-        logger.info("Daily digest: nothing to report, staying quiet")
-        return
-
-    try:
-        digest = await llm.compose_digest("\n\n".join(sections))
+        await digest.run(context.bot, "morning", waiting_cards=_send_waiting_cards)
     except Exception as e:
-        logger.error(f"Digest compose failed: {e}")
-        digest = "\n\n".join(sections)
+        logger.error(f"Morning digest failed: {e}")
 
-    chat_id = config.TELEGRAM_AUTHORIZED_USER_ID
-    body = "☀️ **Morning digest**\n\n" + digest
+
+async def _evening_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
-        await context.bot.send_message(
-            chat_id, markdown_to_telegram_html(body),
-            parse_mode="HTML", disable_web_page_preview=True,
-        )
-    except BadRequest:
-        await context.bot.send_message(chat_id, body)
+        await digest.run(context.bot, "evening", waiting_cards=_send_waiting_cards)
+    except Exception as e:
+        logger.error(f"Evening digest failed: {e}")
+
+
+@auth_required
+async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/digest [evening] — run the briefing now (preview)."""
+    kind = "evening" if context.args and context.args[0].lower().startswith("eve") else "morning"
+    sent = await digest.run(context.bot, kind, chat_id=update.effective_chat.id,
+                            waiting_cards=_send_waiting_cards)
+    if not sent:
+        await update.message.reply_text(f"Nothing to report for the {kind} digest right now.")
 
 
 # ── Bot Setup ─────────────────────────────────────────────────────
@@ -2128,11 +2387,16 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("lock", cmd_lock))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("doctor", cmd_doctor))
+    app.add_handler(CommandHandler("usage", cmd_usage))
     app.add_handler(CommandHandler("update", cmd_update))
     app.add_handler(CommandHandler("restart", cmd_restart))
     app.add_handler(CommandHandler("audit", cmd_audit))
     app.add_handler(CommandHandler("new", cmd_new))
     app.add_handler(CommandHandler("memories", cmd_memories))
+    app.add_handler(CommandHandler("reminders", cmd_reminders))
+    app.add_handler(CommandHandler("waiting", cmd_waiting))
+    app.add_handler(CommandHandler("alerts", cmd_alerts))
+    app.add_handler(CommandHandler("digest", cmd_digest))
     app.add_handler(CommandHandler("forget", cmd_forget))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("signature", cmd_signature))
@@ -2163,6 +2427,9 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("reviews", cmd_reviews))
     app.add_handler(CommandHandler("checkreviews", cmd_checkreviews))
     app.add_handler(CallbackQueryHandler(handle_ops_callback, pattern=r"^ops_"))
+    app.add_handler(CallbackQueryHandler(handle_reminder_callback, pattern=r"^rem_"))
+    app.add_handler(CallbackQueryHandler(handle_waiting_callback, pattern=r"^wait_"))
+    app.add_handler(CallbackQueryHandler(handle_alert_callback, pattern=r"^alert_"))
     app.add_handler(CallbackQueryHandler(handle_approval_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
@@ -2176,6 +2443,24 @@ def build_app() -> Application:
         first=60,  # first index 60s after startup
         name="search_indexer",
     )
+
+    # Urgent inbound alerts: light sync + triage every few minutes
+    if config.ALERT_POLL_MINUTES > 0:
+        app.job_queue.run_repeating(
+            _alerts_job, interval=config.ALERT_POLL_MINUTES * 60, first=90, name="alerts",
+        )
+
+    # Reminders: fire anything due, once a minute
+    app.job_queue.run_repeating(_reminders_job, interval=60, first=20, name="reminders")
+
+    # Near-realtime iMessage indexing: cheap mtime check on chat.db, index only on change
+    if config.IMESSAGE_WATCH_SECONDS > 0:
+        app.job_queue.run_repeating(
+            _imessage_watch,
+            interval=config.IMESSAGE_WATCH_SECONDS,
+            first=config.IMESSAGE_WATCH_SECONDS,
+            name="imessage_watch",
+        )
 
     # Deep mailbox backfill + embedding catch-up: shortly after startup, then daily
     app.job_queue.run_repeating(
@@ -2201,6 +2486,12 @@ def build_app() -> Application:
             time=dtime(hour=config.DIGEST_HOUR, tzinfo=local_tz),
             name="daily_digest",
         )
+        if config.EVENING_DIGEST_HOUR:
+            app.job_queue.run_daily(
+                _evening_digest,
+                time=dtime(hour=config.EVENING_DIGEST_HOUR, tzinfo=local_tz),
+                name="evening_digest",
+            )
 
     # Background review polling
     if config.GOOGLE_PLACES_API_KEY:

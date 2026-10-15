@@ -1,5 +1,5 @@
 """
-Markdown → Telegram HTML rendering.
+Markdown → Telegram HTML rendering, plus `tg_retry` for flood-control-safe sends.
 
 Telegram's HTML parse mode supports: <b> <i> <s> <u> <code> <pre> <a> <blockquote>.
 LLM output is standard-ish markdown; this converts the common subset and
@@ -89,3 +89,28 @@ def markdown_to_telegram_html(text: str) -> str:
         text = text.replace(_PLACEHOLDER.format(i), rendered)
 
     return text
+
+
+# ── Flood control ──────────────────────────────────────────────────
+
+async def tg_retry(factory, retries: int = 1):
+    """
+    Await a Telegram call; on RetryAfter (flood control) sleep the requested time
+    and try again (once by default). BadRequest "message is not modified" is
+    swallowed and returns None; other errors propagate.
+    """
+    import asyncio
+
+    from telegram.error import BadRequest, RetryAfter
+
+    for attempt in range(retries + 1):
+        try:
+            return await factory()
+        except RetryAfter as e:
+            if attempt == retries:
+                raise
+            await asyncio.sleep(float(e.retry_after) + 0.5)
+        except BadRequest as e:
+            if "not modified" in str(e).lower():
+                return None
+            raise

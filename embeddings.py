@@ -33,7 +33,8 @@ def is_enabled() -> bool:
 def _get_client() -> openai.AsyncOpenAI:
     global _client
     if _client is None:
-        _client = openai.AsyncOpenAI(api_key=config.OPENAI_API_KEY)
+        _client = openai.AsyncOpenAI(api_key=config.OPENAI_API_KEY,
+                                     timeout=config.OPENAI_TIMEOUT_SECONDS, max_retries=0)
     return _client
 
 
@@ -55,11 +56,17 @@ async def _init_table() -> None:
 
 async def embed_texts(texts: list[str]) -> list[np.ndarray]:
     """Embed a batch of texts, returning normalized float32 vectors."""
-    response = await _get_client().embeddings.create(
+    import llm  # lazy: llm → agent_tools → search_index would otherwise cycle at import time
+
+    response = await llm.with_retry(lambda: _get_client().embeddings.create(
         model=config.EMBEDDING_MODEL,
         input=[t[:6000] or " " for t in texts],
         dimensions=config.EMBEDDING_DIM,
-    )
+    ), "embed")
+    try:
+        await llm.record_usage("embed", config.EMBEDDING_MODEL, getattr(response, "usage", None))
+    except Exception:
+        pass
     vectors = []
     for item in response.data:
         v = np.asarray(item.embedding, dtype=np.float32)

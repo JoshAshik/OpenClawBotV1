@@ -32,7 +32,8 @@ _outbound_timestamps: deque[float] = deque()
 
 
 def is_authorized(user_id: int) -> bool:
-    return user_id == config.TELEGRAM_AUTHORIZED_USER_ID
+    """Any listed user may use the bot; the first listed id is the owner for pushes."""
+    return user_id in config.TELEGRAM_AUTHORIZED_USER_IDS
 
 
 def is_session_unlocked() -> bool:
