@@ -36,6 +36,7 @@ import db
 import gmail_module
 import indexer
 import llm
+import ops
 import reviews
 import search_index
 import security
@@ -331,6 +332,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/pin `<code>` — Unlock session\n"
         "/lock — Lock session\n"
         "/status — Current state\n"
+        "/doctor — Health checks (tokens, OpenAI, data sources, jobs)\n"
+        "/update — Pull the latest code and restart\n"
+        "/restart — Restart the bot\n"
         "/audit — Recent audit log\n"
         "/help — This message",
         parse_mode="Markdown",
@@ -374,14 +378,111 @@ async def cmd_lock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     rate_ok = security.check_rate_limit()
     used = len(security._outbound_timestamps)
+    last_index = ops.fmt_ts(await db.get_setting(ops.LAST_INDEX_KEY))
+    last_backfill = ops.fmt_ts(await db.get_setting(ops.LAST_BACKFILL_KEY))
+    last_backup = ops.fmt_ts(await db.get_setting(ops.LAST_BACKUP_KEY))
+    started = ops.STARTED_AT.astimezone().strftime("%Y-%m-%d %H:%M")
     await update.message.reply_text(
         f"*Clawdbot Status*\n\n"
         f"Model: `{config.OPENAI_MODEL}`\n"
+        f"Uptime: {ops.uptime_str()} (since {started})\n"
         f"Session: {'unlocked' if security.is_session_unlocked() else 'LOCKED'}\n"
         f"Outbound this hour: {used}/{config.RATE_LIMIT_PER_HOUR}\n"
-        f"Rate limit: {'OK' if rate_ok else 'EXCEEDED'}",
+        f"Rate limit: {'OK' if rate_ok else 'EXCEEDED'}\n\n"
+        f"Last index: {last_index}\n"
+        f"Last backfill: {last_backfill}\n"
+        f"Last backup: {last_backup}\n\n"
+        f"/doctor for full health checks",
         parse_mode="Markdown",
     )
+
+
+# ── Ops: doctor / update / restart ───────────────────────────────
+
+@auth_required
+async def cmd_doctor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = await update.message.reply_text("🩺 Running checks…")
+    checks = await ops.run_doctor(context.job_queue)
+    await msg.edit_text(ops.format_doctor(checks)[:TELEGRAM_MAX_LEN])
+
+
+def _ops_confirm_buttons(op: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Yes, go ahead", callback_data=f"ops_{op}:confirm"),
+        InlineKeyboardButton("❌ Cancel", callback_data=f"ops_{op}:cancel"),
+    ]])
+
+
+@auth_required
+async def cmd_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "Update Clawdbot? This runs `git pull --ff-only` and `pip install -r requirements.txt`, "
+        "then restarts the bot (the supervisor brings it back up).",
+        parse_mode="Markdown",
+        reply_markup=_ops_confirm_buttons("update"),
+    )
+
+
+@auth_required
+async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "Restart Clawdbot now? The bot exits and the supervisor (launchd) starts it again.",
+        reply_markup=_ops_confirm_buttons("restart"),
+    )
+
+
+async def handle_ops_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Confirm/cancel buttons for /update and /restart. Not outbound — no pending_actions."""
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    if not security.is_authorized(user.id):
+        await query.edit_message_text("Unauthorized.")
+        return
+    if not security.is_session_unlocked():
+        await query.edit_message_text("Session locked. Send your PIN to unlock.")
+        return
+
+    op, _, choice = query.data.partition(":")
+    op = op.removeprefix("ops_")
+    if choice != "confirm":
+        await query.edit_message_text(f"{op.capitalize()} cancelled.")
+        return
+
+    if op == "update":
+        await query.edit_message_text("⬇️ Updating… (git pull, pip install)")
+        ok, report = await ops.run_update()
+        await db.log_audit("update", "config", "Update " + ("applied" if ok else "failed"),
+                           detail=report, user_id=user.id, approved=ok)
+        if not ok:
+            await query.edit_message_text(f"❌ Update failed.\n\n{report}"[:TELEGRAM_MAX_LEN])
+            return
+        await query.edit_message_text(f"✅ Updated. Restarting now…\n\n{report}"[:TELEGRAM_MAX_LEN])
+        logger.info("Update applied via /update; restarting")
+        ops.request_exit(context.application)
+
+    elif op == "restart":
+        await db.log_audit("restart", "config", "Restart requested via /restart",
+                           user_id=user.id, approved=True)
+        await query.edit_message_text("🔄 Restarting… I'll say hello when I'm back.")
+        logger.info("Restart requested via /restart")
+        ops.request_exit(context.application)
+
+    else:
+        await query.edit_message_text(f"Unknown operation: {op}")
+
+
+async def _post_init(app: Application) -> None:
+    """Startup ping so crash loops are visible from the phone."""
+    import platform
+    try:
+        await app.bot.send_message(
+            config.TELEGRAM_AUTHORIZED_USER_ID,
+            f"🟢 Clawdbot started on {platform.node()} ({platform.system()}) · "
+            f"model {config.OPENAI_MODEL}",
+        )
+    except Exception as e:
+        logger.warning(f"Startup ping failed: {e}")
 
 
 @auth_required
@@ -1256,6 +1357,7 @@ async def _background_index(context: ContextTypes.DEFAULT_TYPE) -> None:
         total = sum(results.values())
         if total > 0:
             logger.info(f"Background index: {total} new items")
+        await ops.mark_now(ops.LAST_INDEX_KEY)
     except Exception as e:
         logger.error(f"Background index failed: {e}")
 
@@ -1268,8 +1370,23 @@ async def _background_backfill(context: ContextTypes.DEFAULT_TYPE) -> None:
         embedded = await embeddings.embed_missing(limit=3000)
         if indexed or embedded:
             logger.info(f"Backfill: {indexed} emails indexed, {embedded} items embedded")
+        await ops.mark_now(ops.LAST_BACKFILL_KEY)
     except Exception as e:
         logger.error(f"Backfill failed: {e}")
+
+
+async def _background_backup(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Nightly SQLite online backup of clawdbot.db (see ops.backup_database)."""
+    try:
+        await ops.backup_database()
+    except Exception as e:
+        logger.error(f"Backup failed: {e}")
+        try:
+            await context.bot.send_message(
+                config.TELEGRAM_AUTHORIZED_USER_ID, f"⚠️ Nightly database backup failed: {e}"
+            )
+        except Exception:
+            pass
 
 
 # ── Review Commands ───────────────────────────────────────────────
@@ -2003,13 +2120,16 @@ async def _daily_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
 # ── Bot Setup ─────────────────────────────────────────────────────
 
 def build_app() -> Application:
-    app = Application.builder().token(config.TELEGRAM_BOT_TOKEN).build()
+    app = Application.builder().token(config.TELEGRAM_BOT_TOKEN).post_init(_post_init).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("pin", cmd_pin))
     app.add_handler(CommandHandler("lock", cmd_lock))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("doctor", cmd_doctor))
+    app.add_handler(CommandHandler("update", cmd_update))
+    app.add_handler(CommandHandler("restart", cmd_restart))
     app.add_handler(CommandHandler("audit", cmd_audit))
     app.add_handler(CommandHandler("new", cmd_new))
     app.add_handler(CommandHandler("memories", cmd_memories))
@@ -2042,6 +2162,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("removeproperty", cmd_removeproperty))
     app.add_handler(CommandHandler("reviews", cmd_reviews))
     app.add_handler(CommandHandler("checkreviews", cmd_checkreviews))
+    app.add_handler(CallbackQueryHandler(handle_ops_callback, pattern=r"^ops_"))
     app.add_handler(CallbackQueryHandler(handle_approval_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
@@ -2063,6 +2184,14 @@ def build_app() -> Application:
         first=120,
         name="mailbox_backfill",
     )
+
+    # Nightly SQLite backup at the configured local hour
+    if config.BACKUP_ENABLED:
+        app.job_queue.run_daily(
+            _background_backup,
+            time=dtime(hour=config.BACKUP_HOUR, tzinfo=datetime.now().astimezone().tzinfo),
+            name="db_backup",
+        )
 
     # Morning digest at the configured local hour
     if config.DIGEST_ENABLED:

@@ -44,6 +44,11 @@ Guidance for AI-assisted work on Clawdbot — a single-user Telegram assistant b
    conversation-window indexing for iMessage/WhatsApp, contact rebuilds, and inline embedding.
 5. **gmail_module.py** — multi-account OAuth (`token_<label>.json` per account). Replies must keep
    using the RFC `Message-ID` header + `threadId` (recipient-side threading breaks otherwise).
+6. **ops.py** — always-on plumbing: `/doctor` health checks, the nightly SQLite online backup,
+   `/update` (`git pull --ff-only` + pip) and `/restart` (exit 0; launchd's `KeepAlive` restarts
+   the bot — see `deploy/`). Background jobs record `last_index_at` / `last_backfill_at` /
+   `last_backup_at` in `settings`. These are not outbound actions and bypass the approval flow,
+   but every command is still `auth_required` with a confirm button.
 
 ## Conversation storage
 

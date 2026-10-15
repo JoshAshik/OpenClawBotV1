@@ -8,17 +8,22 @@ import asyncio
 import logging
 import signal
 import sys
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 
 import db
 import search_index
 from bot import build_app
+
+# clawdbot.log stays the active file; rotated copies are clawdbot.log.1 … .5 (10 MB each).
+_LOG_PATH = Path(__file__).parent / "clawdbot.log"
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler("clawdbot.log", encoding="utf-8"),
+        RotatingFileHandler(_LOG_PATH, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8"),
     ],
 )
 logger = logging.getLogger("clawdbot")

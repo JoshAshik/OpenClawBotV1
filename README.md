@@ -65,6 +65,7 @@ Optional (defaults in parentheses):
 | `BACKFILL_MAX_EMAILS` | How deep the mailbox history backfill goes, per account (2000) |
 | `INDEX_POLL_INTERVAL_MINUTES` | Incremental indexing cadence (10) |
 | `DIGEST_ENABLED` / `DIGEST_HOUR` | Morning digest on/off and local hour (1 / 8) |
+| `BACKUP_ENABLED` / `BACKUP_HOUR` / `BACKUP_DIR` / `BACKUP_KEEP` | Nightly SQLite backup (1 / 3 / `./backups` / 14) |
 | `SESSION_PIN` | PIN required after each restart (blank = disabled) |
 | `RATE_LIMIT_PER_HOUR` | Max outbound sends per hour (20) |
 | `ONEDRIVE_CLIENT_ID` | Azure app client id, enables OneDrive search/attachments |
@@ -169,7 +170,10 @@ Everything works through natural language; commands are shortcuts and admin cont
 | Command | Description |
 |---|---|
 | `/start` | Wake up and show status |
-| `/status` | Model, session, and rate-limit state |
+| `/status` | Model, uptime, session, rate limit, last index/backfill/backup |
+| `/doctor` | Health checks: Gmail tokens, OpenAI, Mac data sources, disk, jobs |
+| `/update` | `git pull` + `pip install`, then restart (confirm button) |
+| `/restart` | Restart the bot (confirm button; needs a supervisor such as launchd) |
 | `/pin <code>` / `/lock` | Unlock / lock the session |
 | `/audit` | Recent audit log |
 | `/help` | Command reference |
@@ -192,18 +196,28 @@ whatsapp_module.py  — Reads WhatsApp Desktop storage (Mac only)
 reviews.py          — Google Reviews polling via Places API
 telegram_format.py  — Markdown → Telegram HTML rendering
 security.py         — Auth, session PIN, rate limiting
+ops.py              — /doctor health checks, nightly DB backup, /update and /restart
 db.py               — SQLite: turns, memories, contacts, pending actions, audit log
 config.py           — Environment variable loading
+deploy/             — macOS LaunchAgent template + MAC_SETUP.md (24/7 on a Mac mini)
 ```
 
 Runtime data lives next to the code: `clawdbot.db` (index, conversations, memories, audit),
-`token_<label>.json` (Gmail OAuth per account), `onedrive_token.json`, `clawdbot.log`.
+`token_<label>.json` (Gmail OAuth per account), `onedrive_token.json`, `clawdbot.log` (rotates at
+10 MB × 5), and nightly backups in `backups/`.
+
+## Running 24/7 on a Mac
+
+See [deploy/MAC_SETUP.md](deploy/MAC_SETUP.md): Python + venv, copying the live files, Gmail
+tokens that don't expire, the Full Disk Access grant for Messages/WhatsApp/Contacts, and the
+launchd agent that keeps the bot alive across crashes, `/update`, and reboots.
 
 ## Roadmap
 
 [IMPROVEMENT_PLAN.md](IMPROVEMENT_PLAN.md) tracks the build-out. Phases 0–5 (engine, streaming UX,
-structured memory, hybrid search, email production, voice/photos/digest) are complete; Phase 6
-(running on a Mac so iMessage/WhatsApp indexing goes live) is open.
+structured memory, hybrid search, email production, voice/photos/digest) are complete.
+[UPGRADE_PLAN.md](UPGRADE_PLAN.md) continues with Phases 7–12: the Mac mini deployment, real
+iMessage/WhatsApp search and iMessage sending, proactivity, and property-management features.
 
 ## License
 

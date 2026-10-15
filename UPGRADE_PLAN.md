@@ -41,33 +41,34 @@ the machine); WhatsApp is **read-only**; after messaging, **proactivity** comes 
 
 ## Phase 7 — Land it and move it (deployment)   ~1–2 days
 
-- [ ] **Commit the rebuild** on `main` (one "Phases 0–5" commit plus the docs). Add
-      `requirements.lock` from `pip freeze`.
-- [ ] **Mac install:** Python 3.14 (python.org installer or `uv`), venv at `.venv`, `pip install -r
-      requirements.txt`. Bring over `.env`, `credentials.json`, `token_*.json`, `clawdbot.db`
-      (copy via AirDrop/SSH — they're gitignored, never commit).
-- [ ] **launchd LaunchAgent** `~/Library/LaunchAgents/com.clawdbot.bot.plist`: `RunAtLoad`,
-      `KeepAlive`, `WorkingDirectory`, stdout/stderr to `~/Library/Logs/clawdbot/`. Must be a
-      per-user *agent*, not a system daemon — Messages, Contacts and Full Disk Access are
-      per-user. Enable auto-login for that user; `pmset` / Energy settings to never sleep;
-      "Restart after power failure".
-- [ ] **Full Disk Access** for the venv's real interpreter (`.venv/bin/python` is a symlink →
-      grant the framework binary it points to) and **Automation → Messages** (for sending). Add a
-      `/doctor` command that checks: chat.db readable, WhatsApp DB readable, Contacts DB readable,
-      Gmail tokens valid per account, OpenAI reachable, disk free, last index time.
-- [ ] **Gmail token longevity:** switch the OAuth app to "In production" in Google Cloud Console
-      first, then re-run `/addaccount personal` and `/addaccount work` once at the Mac (the
-      browser opens there). No code change needed; add a `/doctor` warning when a token is older
-      than 6 days and the app still looks like Testing (refresh fails with `invalid_grant`).
-- [ ] **One-time macOS setup at the display:** sign Messages into the owner's Apple ID with
-      "Text Message Forwarding" enabled on the iPhone (so SMS arrives too); install and link the
-      native WhatsApp app; open Calendar once so iCloud calendars sync; grant the TCC prompts
-      (Full Disk Access, Automation → Messages, Calendars) when `/doctor` asks for them.
-- [ ] **Ops basics:** `RotatingFileHandler` (10 MB × 5) instead of one ever-growing log; nightly
-      `sqlite3 .backup` of `clawdbot.db` to `~/Backups/clawdbot/` (keep 14) plus Time Machine;
-      `/update` command (git pull → pip install → exit(0) so launchd restarts) and `/restart`;
-      "Clawdbot started" Telegram ping on boot (makes crash loops visible); `/status` shows uptime,
-      last index/backfill time, job health.
+- [x] **Commit the rebuild** on `main` (104a0c0). `requirements.lock` generated from the
+      dependency closure of `requirements.txt` (not a raw freeze — the venv still had a stale
+      `anthropic` package).
+- [ ] **Mac install** — steps written up in `deploy/MAC_SETUP.md`; to be done at the Mac:
+      Python 3.14, venv, `pip install -r requirements.lock`, copy `.env`, `credentials.json`,
+      `token_*.json`, `clawdbot.db` by hand (gitignored, never commit).
+- [ ] **launchd LaunchAgent** — template at `deploy/com.clawdbot.bot.plist` (`RunAtLoad`,
+      `KeepAlive`, `ThrottleInterval` 10, `ProcessType Interactive`, logs to
+      `~/Library/Logs/clawdbot/`); install commands in `MAC_SETUP.md` §7. Auto-login, `pmset`,
+      restart-after-power-failure in §1. To be done at the Mac.
+- [x] **`/doctor` command** (`ops.run_doctor`): Gmail token per account (refreshes, flags
+      `invalid_grant` with the Testing-status hint), OpenAI reachable, chat.db / WhatsApp /
+      Contacts DB opened read-only (➖ on Windows, permission-denied → "grant Full Disk Access"),
+      disk free, DB/log/backup-dir sizes, last index/backfill/backup timestamps, job queue next
+      runs. Verified on Windows: Gmail ❌ (expired tokens, expected), OpenAI ✅, Mac sources ➖.
+- [ ] **Full Disk Access / Automation grants** — `MAC_SETUP.md` §6 (grant to the `readlink -f`
+      target of `.venv/bin/python`). To be done at the Mac.
+- [ ] **Gmail token longevity** — flip the OAuth app to "In production", then `/addaccount` at
+      the Mac (`MAC_SETUP.md` §5). `/doctor` now prints the Testing-status hint on
+      `invalid_grant`.
+- [ ] **One-time macOS setup at the display** — `MAC_SETUP.md` §1 (Messages sign-in + Text
+      Message Forwarding, WhatsApp link, Calendar sync).
+- [x] **Ops basics:** `RotatingFileHandler` (10 MB × 5, `clawdbot.log` stays the active file);
+      nightly SQLite online backup (`ops.backup_database`, `BACKUP_HOUR` 03:00 → `backups/`,
+      `quick_check` verified, keeps `BACKUP_KEEP`=14, Telegram alert on failure); `/update`
+      (confirm button → `git pull --ff-only` → `pip install` → exit 0 for launchd) and `/restart`
+      (confirm → exit 0); "🟢 Clawdbot started" ping in `post_init`; `/status` shows uptime,
+      model, last index/backfill/backup; the index and backfill jobs record their timestamps.
 - **Check:** bot survives a reboot without touching the Mac; `/doctor` is all green; Gmail still
   works 8+ days after connecting.
 

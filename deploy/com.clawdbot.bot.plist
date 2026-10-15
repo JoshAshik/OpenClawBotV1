@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Clawdbot LaunchAgent. Install: see deploy/MAC_SETUP.md.
+         Replace every __USER__ with your macOS short username (e.g. josh)
+         and __PROJECT__ with the absolute project path. -->
+    <key>Label</key>
+    <string>com.clawdbot.bot</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PROJECT__/.venv/bin/python</string>
+        <string>-X</string>
+        <string>utf8</string>
+        <string>__PROJECT__/main.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__PROJECT__</string>
+
+    <!-- Start at login and restart whenever the process exits (crash, /restart, /update). -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <!-- Wait 10s between restarts so a crash loop doesn't spin. -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/__USER__/Library/Logs/clawdbot/stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/__USER__/Library/Logs/clawdbot/stderr.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <!-- Interactive = runs in the logged-in user's session, which is what Messages,
+         Contacts and the TCC permission prompts need. -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
+</dict>
+</plist>

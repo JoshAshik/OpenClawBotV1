@@ -53,6 +53,12 @@ RATE_LIMIT_PER_HOUR = int(os.getenv("RATE_LIMIT_PER_HOUR", "20"))
 # Paths
 DB_PATH = Path(__file__).parent / "clawdbot.db"
 
+# Nightly SQLite backup (local hour; set BACKUP_ENABLED=0 to turn off)
+BACKUP_ENABLED = os.getenv("BACKUP_ENABLED", "1") not in ("0", "false", "no")
+BACKUP_HOUR = int(os.getenv("BACKUP_HOUR", "3"))
+BACKUP_DIR = Path(os.getenv("BACKUP_DIR") or (Path(__file__).parent / "backups"))
+BACKUP_KEEP = int(os.getenv("BACKUP_KEEP", "14"))
+
 # Google Places API (for review monitoring)
 GOOGLE_PLACES_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY", "")
 
