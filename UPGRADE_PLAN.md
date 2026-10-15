@@ -74,15 +74,21 @@ the machine); WhatsApp is **read-only**; after messaging, **proactivity** comes 
 
 ## Phase 8 — Messages for real (the moat)   ~3–5 days
 
-- [ ] **iMessage reader rewrite** (`imessage_module.py`):
-      - Decode `attributedBody` (typedstream → the NSString payload) with `text` as fallback.
-      - Join `chat_message_join` → `chat` for group chats: `chat.display_name` / `chat_identifier`,
-        sender from `handle` per message; `is_from_me` rows have `handle_id = 0`.
-      - Skip tapbacks (`associated_message_type >= 2000`), carry `service` (iMessage/SMS) and
+- [x] **iMessage reader rewrite** (`imessage_module.py`) — done on Windows against the synthetic
+      fixture `tests/fixtures/make_chat_db.py` (`pytest -q`, 32 tests); needs a run against the
+      real chat.db at the Mac:
+      - [x] Decode `attributedBody` (typedstream → the NSString payload); `text` wins when present.
+      - [x] Join `chat_message_join` → `chat` for group chats: `chat.display_name` /
+        `chat_identifier`, sender from `handle` per message; `is_from_me` rows have `handle_id = 0`.
+      - [x] Skip tapbacks (`associated_message_type >= 2000`), carry `service` (iMessage/SMS) and
         attachment filenames (`message_attachment_join` → `attachment`).
-      - Incremental cursor: `settings.imessage_last_rowid`; initial backfill walks the whole DB in
-        pages (tens of thousands of rows is fine — embeddings cost cents).
-      - Conversation windows keyed by *chat*, not handle, so group threads stay together.
+      - [x] Incremental cursor: `settings.imessage_last_rowid` via `read_batch(after_rowid, limit)`;
+        first run walks the whole DB in pages of `IMESSAGE_BATCH_SIZE` (2000); a new batch is
+        widened with the earlier messages of each chat it touches (`get_chat_context`) so an open
+        window re-indexes whole under the same `source_id`.
+      - [x] Conversation windows keyed by *chat* (`chat:<id>`, `handle:<id>` for chat-less rows);
+        titles use `display_name` for groups and the handle for 1:1 — `resolve_name(handle)` on
+        `indexer.build_conversation_windows` is the hook for the Contacts task below.
 - [ ] **Contacts name resolution** (`contacts_module.py`, Mac only): read the Contacts store
       (`~/Library/Application Support/AddressBook/Sources/*/AddressBook-v22.abcddb`: `ZABCDRECORD`,
       `ZABCDPHONENUMBER`, `ZABCDEMAILADDRESS`), normalize phones to E.164, map handle → name.
@@ -125,7 +131,8 @@ the machine); WhatsApp is **read-only**; after messaging, **proactivity** comes 
       after each phase.
 - [ ] **Unit tests (pytest, no network):** `telegram_format`, FTS sanitizer, conversation
       windows, `_to_openai_messages`, the `_EDITABLE_FIELDS` invariant, typedstream decoder, phone
-      normalization. Update `CLAUDE.md` ("there is no test suite" → how to run it).
+      normalization. (pytest scaffold, the decoder and window tests landed with Phase 8;
+      `CLAUDE.md` already says `pytest -q`.)
 - [ ] **Robustness:** retry/backoff on OpenAI 429/5xx and Telegram `RetryAfter`; a per-turn
       timeout; a concurrency guard (second message while a turn runs → "still working on the
       last one" or queue); SQLite WAL mode + `busy_timeout` for `clawdbot.db` under indexer load.

@@ -174,7 +174,7 @@ def _check_mac_sources_sync() -> list[dict]:
     import whatsapp_module
 
     out = []
-    status, detail = _probe_sqlite(imessage_module._DB_PATH, "SELECT ROWID FROM message LIMIT 1")
+    status, detail = _probe_sqlite(imessage_module.db_path(), "SELECT ROWID FROM message LIMIT 1")
     out.append(_check("iMessage (chat.db)", status, detail))
 
     wa_path = whatsapp_module._find_db_path() or whatsapp_module._WA_CHAT_DB

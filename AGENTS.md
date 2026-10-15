@@ -7,8 +7,10 @@ Guidance for AI-assisted work on Clawdbot — a single-user Telegram assistant b
 
 - `python main.py` — long-running polling bot; needs a filled `.env`. Use the venv:
   `.venv\Scripts\python.exe`.
-- There is no test suite. Verify changes with `python -m py_compile <files>` plus an import/build
-  check: `python -c "import bot; bot.build_app()"`.
+- Tests: `pip install -r requirements-dev.txt` once, then `pytest -q` (no network; the iMessage
+  tests build a synthetic `chat.db` from `tests/fixtures/make_chat_db.py` and point the reader at
+  it with `IMESSAGE_DB_PATH`, and index tests use a temp bot DB with embeddings stubbed). Also run
+  `python -m py_compile <files>` and the import/build check: `python -c "import bot; bot.build_app()"`.
 - End-to-end checks call `llm.agent_chat(...)` directly (no Telegram needed) — this hits the real
   OpenAI API and the user's real `clawdbot.db`; keep such tests small and cheap.
 - Dev box is Windows (Git Bash shell; beware cp1252 console output — pass `-X utf8` to Python).
@@ -64,6 +66,10 @@ tool_use from its tool_results.
   digest's unread section then degrade gracefully. The fix is the user running `/addaccount <label>`
   in Telegram — code changes can't fix it.
 - iMessage/WhatsApp modules read Mac-only databases and are intentionally inert on Windows
-  (`is_available()` gates). Phase 6 of `IMPROVEMENT_PLAN.md` (the roadmap doc) covers moving to a Mac.
+  (`is_available()` gates). `IMESSAGE_DB_PATH` (env/config) points `imessage_module` at any
+  chat.db, which is how the tests run on Windows. `UPGRADE_PLAN.md` Phases 7–12 cover the Mac move.
+- `imessage_module` decodes `message.attributedBody` (typedstream) because `message.text` is
+  usually NULL on current macOS; the indexer keeps a ROWID cursor in `settings.imessage_last_rowid`
+  and keys conversation windows by chat (`chat:<id>` / `handle:<id>`), so group threads stay together.
 - `clawdbot.db`, `token_*.json`, `credentials.json`, `.env`, `clawdbot.log` are live user data in
   the repo directory — don't commit, truncate, or overwrite them.

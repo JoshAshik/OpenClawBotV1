@@ -73,3 +73,10 @@ INDEX_POLL_INTERVAL_MINUTES = int(os.getenv("INDEX_POLL_INTERVAL_MINUTES", "10")
 
 # Default Gmail account label (set on startup if token exists)
 DEFAULT_GMAIL_ACCOUNT = os.getenv("DEFAULT_GMAIL_ACCOUNT", "personal")
+
+# iMessage: override the chat.db location (default ~/Library/Messages/chat.db on the Mac).
+# Set to a fixture (tests/fixtures) to exercise the reader on Windows.
+IMESSAGE_DB_PATH = os.getenv("IMESSAGE_DB_PATH", "")
+
+# iMessage backfill page size (rows per batch while walking the whole chat.db)
+IMESSAGE_BATCH_SIZE = int(os.getenv("IMESSAGE_BATCH_SIZE", "2000"))

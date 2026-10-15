@@ -196,36 +196,84 @@ async def index_onedrive() -> int:
 
 _WINDOW_GAP_MINUTES = 30
 
+# settings key holding the last message.ROWID the iMessage indexer has consumed
+IMESSAGE_CURSOR_KEY = "imessage_last_rowid"
 
-def _build_conversation_windows(messages: list[dict], label: str) -> list[dict]:
-    """Group flat messages into windows: [{source_id, title, content, metadata}]."""
-    from datetime import datetime, timedelta
 
-    def _parse(d: str):
-        try:
-            return datetime.fromisoformat(d)
-        except (ValueError, TypeError):
-            return None
+def _identity(handle: str) -> str:
+    return handle
+
+
+def _parse_iso(d) -> "datetime | None":
+    from datetime import datetime
+    try:
+        return datetime.fromisoformat(d)
+    except (ValueError, TypeError):
+        return None
+
+
+def _message_chat_key(m: dict) -> str:
+    """iMessage dicts carry chat_key; older readers (WhatsApp) only a contact."""
+    return m.get("chat_key") or f"handle:{m.get('contact') or 'Unknown'}"
+
+
+def build_conversation_windows(messages: list[dict], label: str,
+                               resolve_name=None) -> list[dict]:
+    """
+    Group flat messages into windows keyed by *chat*: [{source_id, title, content, metadata}].
+
+    A window is one chat's run of messages with no gap longer than _WINDOW_GAP_MINUTES,
+    so group threads stay together and a 1:1 thread is keyed by its handle. The
+    source_id is "<chat_key>|<window start ISO>", stable across runs: a window that
+    grew re-indexes as a content change (needs_reindex), not a new document.
+
+    `resolve_name(handle) -> str` is the hook for Contacts name resolution (a later
+    Phase 8 task); it defaults to identity, so titles use the raw handle until then.
+    """
+    from datetime import timedelta
+
+    resolve = resolve_name or _identity
 
     usable = []
+    seen: set[tuple[str, object]] = set()
     for m in messages:
-        dt = _parse(m.get("date", ""))
-        if dt is not None and m.get("text"):
-            usable.append((m.get("contact") or "Unknown", dt, m))
-    usable.sort(key=lambda x: (x[0], x[1]))
+        dt = _parse_iso(m.get("date", ""))
+        if dt is None or not m.get("text"):
+            continue
+        key = _message_chat_key(m)
+        ident = (key, m.get("rowid") if m.get("rowid") is not None else id(m))
+        if ident in seen:  # context + new batch may overlap
+            continue
+        seen.add(ident)
+        usable.append((key, dt, m))
+    usable.sort(key=lambda x: (x[0], x[1], x[2].get("rowid") or 0))
 
     windows = []
     current = None
-    for contact, dt, m in usable:
-        if (current is None or current["contact"] != contact
+    for key, dt, m in usable:
+        if (current is None or current["key"] != key
                 or dt - current["last_dt"] > timedelta(minutes=_WINDOW_GAP_MINUTES)):
             if current is not None:
                 windows.append(current)
             current = {
-                "contact": contact, "start_dt": dt, "last_dt": dt, "lines": [], "count": 0,
+                "key": key, "first": m, "start_dt": dt, "last_dt": dt,
+                "lines": [], "count": 0, "senders": [], "attachments": [], "services": [],
             }
-        who = "Me" if m.get("is_from_me") else contact
-        current["lines"].append(f"[{dt.strftime('%Y-%m-%d %H:%M')}] {who}: {m['text']}")
+        if m.get("is_from_me"):
+            who = "Me"
+        else:
+            who = resolve(m.get("sender") or m.get("contact") or "Unknown")
+        if who not in current["senders"]:
+            current["senders"].append(who)
+        line = f"[{dt.astimezone().strftime('%Y-%m-%d %H:%M')}] {who}: {m['text']}"
+        atts = m.get("attachments") or []
+        if atts:
+            line += f" [attachments: {', '.join(atts)}]"
+            current["attachments"].extend(atts)
+        svc = m.get("service")
+        if svc and svc not in current["services"]:
+            current["services"].append(svc)
+        current["lines"].append(line)
         current["last_dt"] = dt
         current["count"] += 1
     if current is not None:
@@ -233,17 +281,35 @@ def _build_conversation_windows(messages: list[dict], label: str) -> list[dict]:
 
     docs = []
     for w in windows:
+        first = w["first"]
+        stamp = w["start_dt"].astimezone().strftime("%Y-%m-%d %H:%M")
+        if first.get("is_group"):
+            contact = first.get("display_name") or first.get("contact") or "group"
+            title = f"{label} group \"{contact}\" ({stamp})"
+        else:
+            contact = resolve(first.get("contact") or "Unknown")
+            title = f"{label} with {contact} ({stamp})"
         docs.append({
-            "source_id": f"{w['contact']}|{w['start_dt'].isoformat()}",
-            "title": f"{label} with {w['contact']} ({w['start_dt'].strftime('%Y-%m-%d %H:%M')})",
+            "source_id": f"{w['key']}|{w['start_dt'].isoformat()}",
+            "title": title,
             "content": "\n".join(w["lines"]),
             "metadata": {
-                "contact": w["contact"],
+                "contact": contact,
+                "chat_key": w["key"],
+                "chat_id": first.get("chat_id"),
+                "is_group": bool(first.get("is_group")),
+                "senders": w["senders"],
+                "service": "/".join(w["services"]),
+                "attachments": w["attachments"],
                 "date": w["last_dt"].isoformat(),
                 "messages": w["count"],
             },
         })
     return docs
+
+
+# Backwards-compatible name used by the WhatsApp indexer and older callers.
+_build_conversation_windows = build_conversation_windows
 
 
 async def _index_message_windows(source: str, docs: list[dict]) -> int:
@@ -263,27 +329,87 @@ async def _index_message_windows(source: str, docs: list[dict]) -> int:
     return indexed
 
 
-async def index_imessage(limit: int = 500) -> int:
-    """Index recent iMessage conversations as windows. Mac only."""
+def _imessage_window_context(messages: list[dict], cursor: int) -> list[dict]:
+    """
+    For each chat touched by a new batch, the earlier messages (ROWID <= cursor) that
+    sit in the same window as the batch's first message for that chat, so the window
+    is rebuilt whole instead of being split at the cursor. Sync — run in a thread.
+    """
+    import imessage_module
+
+    if cursor <= 0:
+        return []
+    earliest: dict[str, str] = {}
+    for m in messages:
+        key = m.get("chat_key")
+        if not key or not m.get("date"):
+            continue
+        if key not in earliest or m["date"] < earliest[key]:
+            earliest[key] = m["date"]
+    context: list[dict] = []
+    for key, until_iso in earliest.items():
+        try:
+            context.extend(imessage_module.get_chat_context(
+                key, cursor, until_iso, gap_minutes=_WINDOW_GAP_MINUTES))
+        except Exception as e:  # a bad chat shouldn't stop the batch
+            logger.warning(f"iMessage window context failed for {key}: {e}")
+    return context
+
+
+async def index_imessage(limit: int | None = None, max_batches: int | None = None,
+                         resolve_name=None) -> int:
+    """
+    Index iMessage conversations as chat-keyed windows. Mac only (or IMESSAGE_DB_PATH).
+
+    Keeps a ROWID cursor in settings.imessage_last_rowid: the first run walks the whole
+    chat.db in pages of `limit` (default config.IMESSAGE_BATCH_SIZE) and later runs only
+    read rows added since. Each batch is widened with the earlier messages of the chats
+    it touches so an open conversation re-indexes as one growing document.
+    Returns the number of windows (re)indexed.
+    """
     try:
-        from imessage_module import is_available, get_recent_messages
+        import imessage_module
     except ImportError:
         return 0
 
-    if not is_available():
+    if not imessage_module.is_available():
         _log_unavailable_once("iMessage", "chat.db not found (Mac only)")
         return 0
 
-    try:
-        messages = await asyncio.to_thread(get_recent_messages, limit=limit)
-    except Exception as e:
-        logger.error(f"iMessage index failed: {e}")
-        return 0
+    import config
+    import db
 
-    docs = _build_conversation_windows(messages, "iMessage")
-    indexed = await _index_message_windows("imessage", docs)
+    page = limit or config.IMESSAGE_BATCH_SIZE
+    try:
+        cursor = int(await db.get_setting(IMESSAGE_CURSOR_KEY, "0") or 0)
+    except ValueError:
+        cursor = 0
+
+    indexed = 0
+    batches = 0
+    while True:
+        try:
+            messages, last_rowid = await asyncio.to_thread(
+                imessage_module.read_batch, cursor, page)
+        except Exception as e:
+            logger.error(f"iMessage index failed: {e}")
+            break
+        if last_rowid <= cursor:
+            break  # nothing new
+        if messages:
+            context = await asyncio.to_thread(_imessage_window_context, messages, cursor)
+            docs = build_conversation_windows(context + messages, "iMessage", resolve_name)
+            indexed += await _index_message_windows("imessage", docs)
+        cursor = last_rowid
+        await db.set_setting(IMESSAGE_CURSOR_KEY, str(cursor))
+        batches += 1
+        if batches % 5 == 0:
+            logger.info(f"iMessage backfill: cursor at ROWID {cursor}, {indexed} windows so far")
+        if max_batches and batches >= max_batches:
+            break
+
     if indexed:
-        logger.info(f"iMessage indexer: {indexed} conversation windows indexed")
+        logger.info(f"iMessage indexer: {indexed} conversation windows indexed (cursor {cursor})")
     return indexed
 
 
@@ -401,7 +527,7 @@ async def full_reindex() -> dict:
     results["gmail_backfill"] = await backfill_all_gmail_accounts()
 
     results["onedrive"] = await index_onedrive()
-    results["imessage"] = await index_imessage(limit=2000)
+    results["imessage"] = await index_imessage()
     results["whatsapp"] = await index_whatsapp(limit=2000)
 
     try:
