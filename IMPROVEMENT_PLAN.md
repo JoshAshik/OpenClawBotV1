@@ -4,6 +4,8 @@ Goal: make talking to Clawdbot feel as good as the ChatGPT app for email search 
 while keeping (and actually delivering) its unique edge — WhatsApp/iMessage search and
 property-review monitoring behind an approval flow.
 
+> **Superseded (2026-10-15):** Phase 6 became Phase 8 of [UPGRADE_PLAN.md](UPGRADE_PLAN.md), which is now the live roadmap.
+>
 > **Status (2026-08-02): Phases 0–5 complete; Phase 6 open.** The bot is OpenAI-only (Claude
 > support removed by owner decision). Outstanding to-dos that aren't code: reconnect Gmail
 > (`/addaccount personal` / `work` — both tokens expired), send one real voice note + photo as a

@@ -8,34 +8,36 @@ property-management-aware. Written 2026-10-15.
 the machine); WhatsApp is **read-only**; after messaging, **proactivity** comes first; calendar is
 **Apple Calendar** (EventKit). Telegram stays the only chat surface.
 
-## Where things stand
+## Where things stand (updated 2026-10-15, commit 1c8566c)
 
-- **The whole Phase 0–5 rebuild is uncommitted.** 12 modified files (+2,350 / −444 lines) and 5
-  untracked files (`embeddings.py`, `telegram_format.py`, `CLAUDE.md`, `AGENTS.md`,
-  `IMPROVEMENT_PLAN.md`). Last commit is "PDF Reading Fix". Nothing moves to the Mac until this
-  is committed.
-- `clawdbot.log` (10.8 MB, 71k lines): 1,654 `invalid_grant` (Gmail tokens expired), 1,642
-  iMessage and 2,463 WhatsApp failures — all "Mac-only path not found". Index has zero messages.
-- Dev box is Windows, Python 3.14 venv. The code uses `pathlib` and `asyncio.to_thread`
-  throughout, so nothing is Windows-specific; the Mac-only modules are gated by `is_available()`.
-- Known defects in the Mac modules, found by reading them against current macOS:
-  1. `imessage_module` reads only `message.text`. Since macOS Ventura most rows have `text = NULL`
-     and the body lives in the `attributedBody` blob (NSAttributedString typedstream). On a
-     current Mac the reader would return a small fraction of messages.
-  2. Handles are raw phone numbers / emails; there is no name resolution, so windows are titled
-     "iMessage with +14155551234" and `find_contact` knows nothing about phones.
-  3. Group chats are ignored (`handle_id` is the *sender*, not the chat). Reactions/tapbacks
-     (`associated_message_type` 2000+) would be indexed as text ("Loved ...").
-  4. `whatsapp_module` targets the native Mac App Store app's `ChatStorage.sqlite`; the schema is
-     plausible but has never been run against a real DB, and group-chat sender names
-     (`ZWAGROUPMEMBER`) aren't handled.
-  5. Both readers re-scan "last 500" every poll instead of keeping a ROWID / Z_PK cursor.
-- `/addaccount` runs `InstalledAppFlow.run_local_server`, which opens a browser *on the machine
-  running the bot*. Fine on a Mac with a display: run it once while sitting at the Mac.
-- The repeated `invalid_grant` is almost certainly the Google OAuth consent screen being in
-  **Testing** status: refresh tokens for Testing apps expire after 7 days. Flipping the app to
-  **In production** (unverified is fine for a personal app; Google shows a one-time warning)
-  makes tokens last indefinitely. No code change can fix this.
+- **Everything buildable off the Mac is built, tested and pushed** (`main` at 1c8566c, 178 tests,
+  `pytest -q`). Done: Phase 7 ops code, Phase 8 except WhatsApp schema hardening, Phase 9 except
+  the Responses API migration, Phase 10 except Apple Calendar. Phases 11 and 12 are untouched.
+- **What still needs the Mac mini itself** (see `deploy/MAC_SETUP.md`): install + launchd, the
+  Google OAuth "In production" flip and `/addaccount` re-auth, Full Disk Access / Automation
+  grants, the reboot test; then verifying the real `chat.db` reader, the WhatsApp schema, the
+  `osascript` send, Contacts, and building `calendar_module` (EventKit).
+- **Live-only unknowns:** urgent-alert triage quality, digest wording, price figures in
+  `config.PRICES_PER_MTOK`, and the eval baseline (3 cases, hit@5 67%) — all need real traffic.
+- Known data facts as of today: index is Gmail-only (358 items from two accounts, tokens expired
+  → re-auth on the Mac), zero messages indexed, 7 real chat turns. The original diagnosis
+  below is kept for the record.
+
+### Original diagnosis (2026-10-15, before this plan was executed)
+
+- The whole Phase 0–5 rebuild was uncommitted (landed as 104a0c0).
+- `clawdbot.log`: 1,654 `invalid_grant`, 1,642 iMessage and 2,463 WhatsApp failures — all
+  "Mac-only path not found".
+- Defects found in the Mac modules by reading them against current macOS (all since fixed except
+  the WhatsApp schema probe, which needs the real file):
+  1. `imessage_module` read only `message.text`; current macOS keeps bodies in `attributedBody`.
+  2. No Contacts name resolution; windows were titled by phone number.
+  3. Group chats ignored; tapbacks would have been indexed as text.
+  4. `whatsapp_module` schema never run against a real `ChatStorage.sqlite`.
+  5. Readers re-scanned "last 500" every poll instead of keeping a cursor.
+- `/addaccount` opens a browser on the bot's machine — fine, the Mac has a display.
+- The `invalid_grant` floods are the Google OAuth app sitting in **Testing** status (7-day
+  refresh tokens); flip it to **In production**. No code change can fix this.
 
 ---
 

@@ -126,7 +126,7 @@ a morning briefing arrives at `DIGEST_HOUR` when there's something worth saying.
 
 **iMessage / WhatsApp:** the indexers read the Mac databases (`~/Library/Messages/chat.db`,
 WhatsApp Desktop storage) and are inert on Windows — run the bot on a Mac to activate them.
-See Phase 6 of [IMPROVEMENT_PLAN.md](IMPROVEMENT_PLAN.md).
+See [deploy/MAC_SETUP.md](deploy/MAC_SETUP.md) and Phase 8 of [UPGRADE_PLAN.md](UPGRADE_PLAN.md).
 
 ### Telegram Commands
 
